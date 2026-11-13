@@ -1,0 +1,48 @@
+{
+  "name": "dsh-fast-pdf",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Default PDF renderer for the DSH sidebar: continuous scroll, crisp zoom, native text selection.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "pdf"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node tests/client-smoke.mjs",
+    "check:install": "node tests/install-check.mjs",
+    "check:host": "node tests/host-live.mjs",
+    "check:route": "node tests/host-route-live.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "translate.js",
+    "cordis.patch.yml",
+    "public",
+    "tests",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    },
+    "manifestVersion": 1
+  }
+}

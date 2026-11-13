@@ -1,0 +1,1787 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>booting</title>
+<!-- The real component, mounted on real React with props shaped like the Host's.
+     Served from a directory whose `fast-pdf/` is the plugin's own public dir, so
+     the component resolves its own assets exactly as it will in the app. -->
+<script src="./vendor/react.production.min.js"></script>
+<script src="./vendor/react-dom.production.min.js"></script>
+<link rel="stylesheet" href="./fast-pdf/viewer.css" />
+<style>
+    /* Copied from the app stylesheet (_button_1rv3m_*), so the fake primitives
+       occupy the same box the real ones do. */
+    .fp-host-btn { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 4px; border: none; border-radius: var(--dsw-radius-md, 12px); cursor: pointer; font-size: 14px; line-height: 22px; color: var(--dsw-alias-label-primary, #1a1a1a); background: transparent; padding: 0 14px; }
+    .fp-host-md { height: 36px; }
+    .fp-host-sm { height: 28px; font-size: 12px; line-height: 18px; padding: 0 10px; border-radius: var(--dsw-radius-sm, 8px); }
+    .fp-host-ghost:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover, #00000010); }
+    .fp-host-outline { border: .5px solid var(--dsw-alias-border-l3, #00000024); background: transparent; }
+    .fp-host-primary { background: var(--dsw-alias-button-primary-fill, #2b6cff); color: var(--dsw-alias-label-primary-foreground, #fff); }
+    .fp-host-icon { display: inline-flex; width: 16px; height: 16px; align-items: center; justify-content: center; }
+    .fp-host-tip { display: flex; }
+    .fp-host-btn:disabled { opacity: .4; cursor: default; }
+  /* The Host's own palette, read out of
+     @deepseek-ai/dsh-client-ui-theme 0.2.1-rc.3 (the `body` and
+     `body[data-ds-dark-theme]` rules), with the same selectors so a screenshot
+     here shows the pane as it will look in the app rather than as it looks when
+     every var() falls back. */
+  body {
+    color-scheme: light;
+    --dsw-radius-sm: 8px;
+    --dsw-radius-md: 12px;
+    --dsw-radius-lg: 16px;
+    --dsw-elevation-stroke-color: #00000029;
+    --dsw-elevation-prominent: 0 0 0 .5px var(--dsw-elevation-stroke-color);
+    --dsw-alias-bg-base: #fff;
+    --dsw-alias-bg-document-preview: #ebeef2;
+    --dsw-alias-bg-document-selection: color-mix(in srgb, #2b6cff 40%, transparent);
+    --dsw-alias-label-document-preview: #61666b;
+    --dsw-alias-bg-layer-1: #fff;
+    --dsw-alias-bg-layer-2: #fff;
+    --dsw-alias-bg-layer-3: #fff;
+    --dsw-alias-border-l1: #0000000a;
+    --dsw-alias-border-l2: #0000001a;
+    --dsw-alias-border-l3: #0000001f;
+    --dsw-alias-interactive-bg-hover: #2631480f;
+    --dsw-alias-label-primary: #0f1115;
+    --dsw-alias-label-secondary: #61666b;
+    --dsw-alias-label-tertiary: #81858c;
+    --dsw-alias-state-warn-label: #dd8629;
+    --dsw-alias-button-primary-fill: #0f1115;
+    --dsw-alias-label-primary-foreground: #fff;
+  }
+  body[data-ds-dark-theme] {
+    color-scheme: dark;
+    --dsw-elevation-stroke-color: #ffffff29;
+    --dsw-alias-bg-base: #151517;
+    --dsw-alias-bg-document-preview: #151517;
+    --dsw-alias-label-document-preview: #cfd3d6;
+    --dsw-alias-bg-layer-1: #232324;
+    --dsw-alias-bg-layer-2: #2c2c2e;
+    --dsw-alias-bg-layer-3: #353638;
+    --dsw-alias-border-l1: #ffffff0f;
+    --dsw-alias-border-l2: #ffffff1f;
+    --dsw-alias-border-l3: #ffffff29;
+    --dsw-alias-interactive-bg-hover: #ffffff14;
+    --dsw-alias-label-primary: #f9fafb;
+    --dsw-alias-label-secondary: #cfd3d6;
+    --dsw-alias-label-tertiary: #adb2b8;
+    --dsw-alias-state-warn-label: #dd8629;
+    --dsw-alias-button-primary-fill: #f9fafb;
+    --dsw-alias-label-primary-foreground: #0f1115;
+  }
+  html, body { margin: 0; block-size: 100%; font: 13px/1.4 system-ui, sans-serif; color: var(--dsw-alias-label-primary, #1a1a1a); background: var(--dsw-alias-bg-base, #f6f7f9); }
+  /* The document slot is a flex column in the app; mirror that so the pane gets
+     measured the way it will be there. */
+  #host, #host2 { block-size: 720px; inline-size: 460px; display: flex; flex-direction: column; background: var(--dsw-alias-bg-base, #fff); border: 1px solid var(--dsw-alias-border-l3, #d8dbe0); }
+  #facts { font: 11px ui-monospace, monospace; white-space: pre-wrap; padding: 6px; }
+</style>
+</head>
+<body>
+<div id="host"></div>
+<div id="host2"></div>
+<div id="facts"></div>
+<script>
+  const params = new URLSearchParams(location.search);
+  if (params.get("pane") !== null) {
+    document.getElementById("host").style.inlineSize = `${params.get("pane")}px`;
+  }
+  // `&paneH=` shortens the pane. The outline keeps its head at the top however
+  // long the tree is, and that can only be measured once the tree overflows the
+  // column — which a 720px pane is too tall for with the samples here.
+  if (params.get("paneH") !== null) {
+    document.getElementById("host").style.blockSize = `${params.get("paneH")}px`;
+  }
+  // `&dark=1` puts the page under the Host's dark selector instead of its light one.
+  if (params.get("dark") === "1") document.body.setAttribute("data-ds-dark-theme", "");
+  // `&bare=1` takes the palette away again (`initial` is guaranteed-invalid for a
+  // custom property, so every var() has to use its fallback) — the path a page
+  // outside the app sees.
+  if (params.get("bare") === "1") {
+    for (const sheet of document.styleSheets) {
+      for (const rule of sheet.cssRules) {
+        if (rule.selectorText !== "body" && rule.selectorText !== "body[data-ds-dark-theme]") continue;
+        for (const property of rule.style) {
+          if (property.startsWith("--dsw-")) document.body.style.setProperty(property, "initial");
+        }
+      }
+    }
+  }
+  const facts = [];
+  const note = (key, value) => facts.push(`${key}=${value}`);
+
+  // The dictionary below mirrors the one `client.js` binds, so a missing key
+  // shows up in the facts as its own name instead of passing silently.
+  const DICT = {
+    title: "快速 PDF",
+    loading: "正在打开 PDF…",
+    failed: "这个 PDF 打不开",
+    invalidPdf: "文件不是有效的 PDF，或者已经损坏",
+    missingPdf: "读不到这个文件，可能已经移动或删掉了",
+    retry: "重试",
+    previous: "上一页",
+    next: "下一页",
+    zoomIn: "放大",
+    zoomOut: "缩小",
+    fitWidth: "适应宽度",
+    fitPage: "整页显示",
+    historyBack: "后退到上一个位置",
+    historyForward: "前进到下一个位置",
+    outline: "目录",
+    find: "查找",
+    findPlaceholder: "在本 PDF 中查找",
+    findPrevious: "上一个",
+    findNext: "下一个",
+    findIndexing: "正在建立索引…",
+    findNone: "没有找到",
+    translate: "翻译",
+    translating: "翻译中…",
+    // The two cards a probe can only recognise by their copy: a selection past
+    // the limit, and a call that ran out of time. Without them here the harness
+    // measured the key name instead of the sentence.
+    selectionTooLong: "选中的内容太多了，一次最多翻译 6000 个字符",
+    translateTimeout: "翻译等太久了，请重试",
+    copy: "复制",
+    copied: "已复制",
+    close: "关闭",
+    passwordTitle: "这个 PDF 需要密码",
+    passwordHint: "输入打开密码",
+    passwordWrong: "密码不对，再试一次",
+    passwordPlaceholder: "密码",
+    passwordOpen: "打开",
+    passwordCancel: "取消",
+    passwordCancelled: "没有输入密码，PDF 没有打开",
+    pageNumber: "页码",
+    matchCase: "区分大小写",
+    wholeWord: "整个词",
+    expandAll: "展开全部",
+    collapseAll: "折叠全部",
+    properties: "文档属性",
+    more: "更多",
+    fileName: "文件名",
+    fileSize: "文件大小",
+    documentPageCount: "页数",
+    pageSize: "页面尺寸",
+    documentLocationPath: "位置",
+    documentTitle: "标题",
+    documentAuthor: "作者",
+    documentSubject: "主题",
+    documentKeywords: "关键词",
+    documentCreationDate: "创建时间",
+    documentModDate: "修改时间",
+    documentCreator: "创建程序",
+    documentProducer: "生成程序",
+    pdfVersion: "PDF 版本",
+    fastWebView: "快速 Web 查看",
+    pagePortrait: "纵向",
+    pageLandscape: "横向",
+    pageSizeValue: "{width} × {height} mm · {orientation}",
+    fileSizeBytes: "{count} B",
+    fileSizeKb: "{count} KB",
+    fileSizeMb: "{count} MB",
+    yes: "是",
+    no: "否",
+    stop: "停止",
+    pin: "固定这个翻译",
+    unpin: "取消固定",
+    source: "原文",
+    loadingWaiting: "等待数据…",
+    loadingReceived: "已收到 {loaded}",
+    loadingBytes: "{loaded} / {total} · {percent}%",
+    loadingPrepare: "正在排版…",
+  };
+  const t = (key) => DICT[key] ?? key;
+
+  window.__ModuleLoader__ = { load: (mod) => { window.__mod = mod; } };
+
+  /**
+   * A stand-in for the shell's primitives collection: the same markup the app's
+   * `Button` builds, with the app's own class rules copied below, so a layout
+   * measured with this in place means something. The real thing only exists
+   * inside a running DeepSeek Harness.
+   */
+  window.__fakePrimitives = () => {
+    const h = window.React.createElement;
+    const Button = window.React.forwardRef(function Button({ variant = "ghost", size = "md", icon, className, children, ...rest }, ref) {
+      return h("button", {
+        ref,
+        type: "button",
+        className: ["fp-host-btn", `fp-host-${variant}`, `fp-host-${size}`, className].filter(Boolean).join(" "),
+        ...rest,
+      }, icon == null ? null : h("span", { className: "fp-host-icon" }, icon), children);
+    });
+    const Tooltip = ({ label, children }) => h("span", { className: "fp-host-tip", title: label }, children);
+    // Icons: a circle in the icon's box is enough to prove the slot fills.
+    const iconFor = (size) => (props) => h("svg", {
+      width: String(props?.size ?? size),
+      height: String(props?.size ?? size),
+      viewBox: "0 0 16 16",
+      "aria-hidden": "true",
+    }, h("circle", { cx: "8", cy: "8", r: "5.5", fill: "none", stroke: "currentColor", strokeWidth: "1.5" }));
+    const collection = { Button, Tooltip, writeClipboard: (text) => navigator.clipboard.writeText(text) };
+    return new Proxy(collection, {
+      get: (base, name) => (typeof name === "string" && name.startsWith("Icon") ? iconFor(16) : base[name]),
+    });
+  };
+
+  const retained = [];
+  const registered = { preview: [], slot: null };
+  const ctx = {
+    effect: (fn) => fn(),
+    locale: { bind: () => t, register: () => () => {} },
+    documentPreviews: { register: (def) => { registered.preview.push(def); return () => {}; } },
+    slots: {
+      inject: (_name, fn) => fn(),
+      register: (options, component) => { registered.slot = { options, component }; return () => {}; },
+    },
+  };
+
+  const settle = (ms) => new Promise((done) => setTimeout(done, ms));
+
+  /** Wait until `test()` is truthy or the time is up. */
+  async function until(test, ms = 8000, step = 60) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (test()) return true;
+      await settle(step);
+    }
+    return false;
+  }
+
+  const text = (selector, root = document) => root.querySelector(selector)?.textContent?.trim() ?? null;
+  const all = (selector, root = document) => [...root.querySelectorAll(selector)];
+  // Icon buttons carry no text, so the label is the readout that matters.
+  const labelOf = (b) => (b.textContent.trim() === "" ? b.getAttribute("aria-label") ?? "" : b.textContent.trim());
+  const buttons = () => all("#host button").map((b) => `${labelOf(b)}${b.disabled ? "(off)" : ""}`);
+  // The page readout is an editable field next to a total now, and a field's
+  // value is not `textContent` — so the label is composed the way a reader reads
+  // it: the number in the box, a slash, the total.
+  const pagesLabelIn = (root) => {
+    const box = document.querySelector(`${root} .fp-pageno`);
+    if (box === null) return null;
+    const field = box.querySelector(".fp-page-input");
+    const total = (box.querySelector(".fp-pages-total")?.textContent ?? "").trim().replace(/^\/\s*/u, "");
+    return `${field?.value ?? ""} / ${total}`;
+  };
+  const pagesLabel = () => pagesLabelIn("#host");
+  /**
+   * The selection's *focus* end, measured without the plugin's own helper: a
+   * collapsed range at the focus, or the last character before it when that
+   * comes back empty. The union rect of a multi-line selection is a different
+   * rectangle, and comparing a bubble against it proves nothing.
+   */
+  const focusEndBox = (selection) => {
+    if (selection === null || selection === undefined || selection.rangeCount === 0) return null;
+    const node = selection.focusNode;
+    const offset = selection.focusOffset;
+    if (node !== null) {
+      const probe = document.createRange();
+      probe.setStart(node, offset);
+      probe.setEnd(node, offset);
+      let rect = probe.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0 && node.nodeType === 3 && offset > 0) {
+        // A caret at the very end of a text node measures nothing; the character
+        // before it is the same edge on screen.
+        probe.setStart(node, offset - 1);
+        probe.setEnd(node, offset);
+        rect = probe.getBoundingClientRect();
+      }
+      if (rect.width !== 0 || rect.height !== 0) return rect;
+    }
+    // An element-level focus (selectNodeContents lands here) has no caret to
+    // measure, so the focus end is one edge of the range: the first rect when the
+    // selection was made backwards, the last one when it was made forwards.
+    const rects = [...selection.getRangeAt(0).getClientRects()].filter((r) => r.width !== 0 || r.height !== 0);
+    if (rects.length === 0) return null;
+    const order = document.createRange();
+    order.setStart(selection.anchorNode, selection.anchorOffset);
+    order.setEnd(selection.focusNode, selection.focusOffset);
+    // setStart-after-setEnd collapses: that is how a backwards selection reads.
+    return order.collapsed ? rects[0] : rects.at(-1);
+  };
+  const hasCanvas = () => document.querySelector("#host .fp-pages canvas") !== null;
+
+  /** Open the toolbar's overflow menu and wait for it to be there. */
+  async function openMore() {
+    click(DICT.more);
+    return until(() => document.querySelector("#host .fp-menu") !== null, 3000);
+  }
+
+  /** Click the button whose caption is `label`. */
+  function click(label) {
+    // Caption, title or aria-label: icon buttons are labelled, text ones are not.
+    const hit = all("#host button").find((b) => b.textContent.trim() === label
+      || b.getAttribute("title") === label || b.getAttribute("aria-label") === label);
+    if (hit === undefined) throw new Error(`no button titled ${label} in ${buttons().join(" | ")}`);
+    hit.click();
+    return hit;
+  }
+
+  /** Type into a controlled input the way a user would. */
+  function type(input, value) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  async function run() {
+    const scenario = params.get("scenario") ?? "mount";
+    const source = params.get("pdf") ?? "./samples/plain.pdf";
+    const fetchBytes = async (path) => new Uint8Array(await (await fetch(path)).arrayBuffer());
+    const bytes = await fetchBytes(source);
+
+    // Translation goes to the Host's route; stand in for it here so the bubble's
+    // own state machine is what gets tested.
+    const realFetch = window.fetch.bind(window);
+    // `?realTranslate=1` lets the real route answer (through the plugin's own
+    // handler) while still recording what the bubble sent: the header and body
+    // contract is only tested when the request actually leaves this page.
+    const passthrough = params.get("realTranslate") === "1";
+    window.fetch = async (input, init) => {
+      const url = String(input);
+      if (url.includes("/fast-pdf/translate") && passthrough) {
+        window.__translateBody = init?.body ?? null;
+        window.__translateHeaders = init?.headers ?? null;
+        const answer = await realFetch(input, init);
+        window.__translateStatus = answer.status;
+        window.__translateRaw = await answer.clone().text();
+        return answer;
+      }
+      if (url.includes("/fast-pdf/translate")) {
+        window.__translateBody = init?.body ?? null;
+        // `&streamTranslate=1` answers the way the Host now does — one JSON
+        // object per line, spaced out — so the card's progressive paint is what
+        // gets measured. Without it the old one-shot JSON stays the default,
+        // which is also the compatibility path for a Host that does not stream.
+        if (params.get("streamTranslate") === "1") {
+          const pieces = ["译文：", "第 2 页提到 ", "OpenRouter 与 160%。"];
+          window.__streamTicks = [];
+          return new Response(new ReadableStream({
+            start(controller) {
+              const encoder = new TextEncoder();
+              let at = 0;
+              const tick = () => {
+                if (at < pieces.length) {
+                  controller.enqueue(encoder.encode(`${JSON.stringify({ delta: pieces[at] })}\n`));
+                  window.__streamTicks.push({ at: performance.now(), chars: pieces.slice(0, at + 1).join("").length, shown: (document.querySelector("#host .fp-pick-text")?.textContent ?? "").length });
+                  at += 1;
+                  setTimeout(tick, 140);
+                  return;
+                }
+                controller.enqueue(encoder.encode(`${JSON.stringify({
+                  ok: true,
+                  text: pieces.join(""),
+                  target: "Chinese",
+                  provider: "swzc-tech",
+                  model: "DeepSeek-V4.1-Flash-1017",
+                  ms: 420,
+                })}\n`));
+                controller.close();
+              };
+              setTimeout(tick, 140);
+            },
+          }), { status: 200, headers: { "content-type": "application/x-ndjson; charset=utf-8" } });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          text: "译文：第 2 页提到 OpenRouter 与 160%。",
+          target: "Chinese",
+          provider: "swzc-tech",
+          model: "DeepSeek-V4.1-Flash-1017",
+          ms: 900,
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return realFetch(input, init);
+    };
+
+    // Every place the pane remembers, in order: `rememberPlace` writes into a
+    // module-level Map, so watching Map#set is the cheapest way to see it.
+    window.__placeLog = [];
+    const originalSet = Map.prototype.set;
+    Map.prototype.set = function set(key, value) {
+      if (value !== null && typeof value === "object" && "scrollTop" in value && "page" in value) {
+        window.__placeLog.push(`${key}:${value.page}/${value.zoom}/${Math.round(value.scrollTop)}`);
+      }
+      return originalSet.call(this, key, value);
+    };
+
+    const core = await import("/fast-pdf/viewer.mjs");
+    const originalRestore = core.PdfViewer.prototype.applyReadingPosition;
+    core.PdfViewer.prototype.applyReadingPosition = function restore(state, options) {
+      window.__restore = `${state?.page ?? "-"}/${state?.zoom ?? "-"}/${Math.round(state?.scrollTop ?? -1)}/${state?.anchor ? "anchor" : "offset"}`;
+      return originalRestore.call(this, state, options);
+    };
+    const originalState = core.PdfViewer.prototype.getState;
+    window.__stateLog = [];
+    core.PdfViewer.prototype.getState = function state() {
+      const held = originalState.call(this);
+      const line = `${held.page}/${held.zoom}/${Math.round(held.scrollTop)}`;
+      window.__saved = line;
+      window.__stateLog.push(line);
+      return held;
+    };
+    // Every scroll the core reports, so it is clear whether it reported at all.
+    window.__scrollLog = [];
+    const originalScrollHandler = Object.getOwnPropertyDescriptor(core.PdfViewer.prototype, "onScrollPosition");
+
+    new Function(await (await fetch("/plugins/dsh-fast-pdf/client.js")).text())();
+    const withPrimitives = params.get("primitives") === "1";
+    const mod = window.__mod.factory((spec) => {
+      if (spec === "react") return window.React;
+      if (spec === "@deepseek-ai/dsh-client-ui-primitives" && withPrimitives) return window.__fakePrimitives();
+      throw new Error(`unexpected require(${spec})`);
+    });
+    mod.apply(ctx);
+
+    const Body = registered.slot.component;
+    const injected = typeof registered.slot.options.inject === "function"
+      ? registered.slot.options.inject("sess-46", { forget: (tabId) => retained.push(`forget:${tabId}`) })
+      : {};
+    const retainTab = typeof injected.retainTab === "function"
+      ? (tabId, signal) => {
+        retained.push(`retain:${tabId}`);
+        return injected.retainTab(tabId, signal);
+      }
+      : undefined;
+    note("previewKeys", Object.keys(registered.preview[0] ?? {}).join("+"));
+    note("bodyKey", registered.slot.options.key);
+    note("injectKeys", Object.keys(injected).join("+"));
+    // The running app hands `inject` a session and nothing else: the slot only
+    // carries an action bag for registrations that bring a store of their own.
+    // This is the path that used to throw and blank the pane, so it stays walked.
+    let bare = "ok";
+    try {
+      const withoutActions = registered.slot.options.inject("sess-46");
+      withoutActions.retainTab("tab-bare", new AbortController().signal);
+    } catch (error) {
+      bare = String((error && error.message) || error).slice(0, 80);
+    }
+    note("injectWithoutActions", bare);
+
+    // The Host gives every document body a container that declares the code font
+    // for its text preview (`font-family: var(--dsw-font-mono, ui-monospace,
+    // monospace); white-space: pre`), and each built-in body opts out on its own
+    // root. A bare `.fp-root` inside such a container is the whole measurement:
+    // if the family still says monospace, the pane inherits the code font and its
+    // chrome stops being the same typeface as the rest of the app.
+    const monoHost = document.createElement("div");
+    monoHost.style.cssText = "font-family: ui-monospace, monospace; white-space: pre; font-size: 13px";
+    const monoPane = document.createElement("div");
+    monoPane.className = "fp-root";
+    monoHost.append(monoPane);
+    document.body.append(monoHost);
+    const monoStyle = getComputedStyle(monoPane);
+    note("paneFont", String(monoStyle.fontFamily ?? "-").slice(0, 46));
+    note("paneWhiteSpace", String(monoStyle.whiteSpace));
+    note("paneIsMono", /monospace/u.test(String(monoStyle.fontFamily ?? "")));
+    monoHost.remove();
+
+    const host = document.getElementById("host");
+    const root = window.ReactDOM.createRoot(host);
+    // One tab throughout, so the reading place and the retention seat are keyed
+    // the same way across an unmount and a remount.
+    const tabSignal = new AbortController().signal;
+    // The Host no longer hands a body the file: with `loading: "renderer"` it
+    // hands a handle (`{ revision, reload, loaded, failed }`) and the body reads
+    // the bytes itself. `&disk=<absolute path>` makes that read real — it goes
+    // through the plugin's own `POST /fast-pdf/file` on this very server, the
+    // same route the running app uses, so the stream, the progress line and the
+    // 256 MiB ceiling are all exercised rather than simulated. Without it the
+    // harness serves the bytes it already fetched, which keeps the other
+    // scenarios independent of the filesystem.
+    const disk = new URLSearchParams(window.location.search).get("disk");
+    const addressOf = (state) => {
+      const encoded = encodeURIComponent(String(state.disk ?? ""));
+      return `dsh-resource://file/session/sess-46/${encoded.replaceAll("%2F", "/").replaceAll("%5C", "/")}`;
+    };
+    const handle = { revision: 0, loaded: [], failed: 0 };
+    const served = { data: new Uint8Array(0), disk: disk };
+    const readBytes = async (address, signal, onProgress) => {
+      if (disk !== null) {
+        note("readerRoute", address);
+        return injected.readBytes(address, signal, onProgress);
+      }
+      const source = served.data;
+      const reader = new Response(
+        new ReadableStream({
+          start(controller) {
+            for (let at = 0; at < source.length; at += 1024 * 1024) {
+              controller.enqueue(source.slice(at, at + 1024 * 1024));
+            }
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "content-length": String(source.length) } },
+      );
+      return new Response(reader.body).arrayBuffer().then((buffer) => {
+        if (typeof onProgress === "function") onProgress(1);
+        return { bytes: new Uint8Array(buffer), version: 1 };
+      });
+    };
+    const show = (data, address, diskPath = null) => {
+      served.data = data;
+      // With `&disk`, the pane's address is the real session file, so the route
+      // is asked for the file that is actually on disk. A document switch has to
+      // move that target too, otherwise the pane dutifully re-reads the *same*
+      // file and the swap is invisible (measured: 1 / 12 → 1 / 12).
+      if (diskPath !== null) served.disk = diskPath;
+      if (served.disk !== null) address = addressOf(served);
+      handle.revision += 1;
+      const content = {
+        kind: "renderer",
+        revision: handle.revision,
+        reload: () => show(served.data, address),
+        loaded: (version) => handle.loaded.push(version),
+        failed: () => { handle.failed += 1; },
+      };
+      root.render(window.React.createElement(Body, {
+        content,
+        resourceAddress: address,
+        readBytes,
+        t,
+        sessionId: injected.sessionId ?? "sess-46",
+        retainTab,
+        useTabInfo: () => ({ tab: { id: "tab-body", signal: tabSignal, contentId: "content-1" } }),
+        useStore: () => null,
+        actions: { forget: () => {} },
+        renderSlot: () => null,
+      }));
+    };
+    note("injectReadBytes", typeof injected.readBytes);
+    const address = `file:///C:/docs/${source.replace(/^\.\//u, "")}`;
+
+    show(bytes, address);
+
+    // Watched from the first tick, because this line is only on screen while
+    // the bytes are still arriving — a scenario that waits for `ready` measures
+    // the pane after the thing it is looking for has gone.
+    const loadingSeen = [];
+    const watchLoading = async () => {
+      for (let tick = 0; tick < 400; tick += 1) {
+        const line = document.querySelector("#host .fp-loading-text")?.textContent?.trim();
+        const mode = document.querySelector("#host .fp-loading-track")?.dataset.mode;
+        if (line !== undefined && line !== "") loadingSeen.push(`${line}${mode === undefined ? "" : `[${mode}]`}`);
+        if (document.querySelector("#host .fp-status") === null && tick > 10) return;
+        await settle(15);
+      }
+    };
+    // The failing document keeps its status line forever, so the watcher would
+    // only spin there; that scenario says what it has to say and returns.
+    const watching = scenario === "fail" ? Promise.resolve() : watchLoading();
+
+    if (scenario === "fail") {
+      // Not a PDF at all: the pane has to say so and offer a retry.
+      note("failedShown", await until(() => document.querySelector("#host .fp-status[data-failed]") !== null, 20000));
+      note("failedText", (text("#host .fp-status") ?? "-").slice(0, 60));
+      const retry = all("#host .fp-status button").find((b) => b.textContent.trim() === "重试");
+      note("hasRetry", retry !== undefined);
+      retry?.click();
+      note("retryRunsAgain", await until(() => document.querySelector("#host .fp-status[data-failed]") !== null, 20000));
+      note("stillNoCanvas", !hasCanvas());
+      return;
+    }
+
+    note("ready", await until(hasCanvas, 25000));
+    await watching;
+    note("loadingSeen", [...new Set(loadingSeen)].slice(0, 4).join(" | ") || "none");
+    // A canvas exists as soon as the page host has one, but the toolbar stays
+    // disabled until the document reports its page count — so wait for that,
+    // or a click on 查找 lands on a disabled button and does nothing.
+    note("settled", await until(() => /\/\s*\d/u.test(pagesLabel() ?? ""), 25000));
+    note("canvases", all("#host .fp-pages canvas").length);
+    // The renderer handshake: the body must tell the Host it is done, or the
+    // pane keeps treating the tab as loading.
+    note("loadedVersions", handle.loaded.join(",") || "-");
+    note("reader", disk === null ? "harness" : "plugin-route");
+    note("pagesCount", pagesLabel());
+    note("retainedTabs", [...new Set(retained)].join("|") || "-");
+
+    if (scenario === "mount") {
+      note("outlineButtonAppeared", await until(() => all("#host button").some((b) => b.getAttribute("aria-label") === DICT.outline), 12000));
+      note("toolbar", buttons().join(" "));
+      note("zoomCount", text("#host .fp-zoom-count"));
+      note("frameHeight", Math.round(document.querySelector("#host .fp-frame").getBoundingClientRect().height));
+      // Geometry, because "the toolbar wrapped" is the failure mode that only
+      // shows up when a control is added. One 28px row plus its padding is 37;
+      // anything taller means a second row.
+      const bar = document.querySelector("#host .fp-toolbar");
+      const box = (el) => (el === null ? null : `${Math.round(el.getBoundingClientRect().width)}x${Math.round(el.getBoundingClientRect().height)}`);
+      note("toolbarBox", box(bar));
+      note("toolbarOneRow", bar !== null && bar.getBoundingClientRect().height <= 40);
+      note("pagerBox", box(document.querySelector("#host .fp-pageno")));
+      note("pagerOneRow", (() => {
+        const field = document.querySelector("#host .fp-page-input");
+        const total = document.querySelector("#host .fp-pages-total");
+        if (field === null || total === null) return null;
+        const a = field.getBoundingClientRect();
+        const b = total.getBoundingClientRect();
+        // Same row means the vertical centres line up, whatever the two boxes'
+        // heights are: a 22px field and a 12px label cannot share a top edge.
+        return Math.abs((a.top + a.height / 2) - (b.top + b.height / 2)) < 4;
+      })());
+      note("pagerDisplay", (() => {
+        const pages = document.querySelector("#host .fp-pageno");
+        if (pages === null) return null;
+        const style = getComputedStyle(pages);
+        return `${style.display}/${style.alignItems}/${style.flexWrap}/${Math.round(pages.getBoundingClientRect().height)}`;
+      })());
+    }
+
+    if (scenario === "nav") {
+      note("start", pagesLabel());
+      click(DICT.next);
+      click(DICT.next);
+      await settle(500);
+      note("afterTwoNext", pagesLabel());
+      click(DICT.previous);
+      await settle(400);
+      note("afterPrev", pagesLabel());
+      click(DICT.zoomIn);
+      await settle(400);
+      note("afterZoomIn", text("#host .fp-zoom-count"));
+      all("#host .fp-zoom button").at(-1).click();
+      await settle(700);
+      note("afterFit", text("#host .fp-zoom-count"));
+      click(DICT.previous);
+      click(DICT.previous);
+      await settle(600);
+      note("afterTwoPrevInstant", pagesLabel());
+    }
+
+    if (scenario === "dblclick") {
+      // Double-click enlarges two toolbar steps and a second one restores the
+      // zoom the first one started from — the reader's 放大 / 还原.
+      const frame = document.querySelector("#host .fp-frame");
+      const page = document.querySelector("#host .fp-pages .page");
+      const doubleClick = () => page.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+      note("zoomBefore", text("#host .fp-zoom-count"));
+      doubleClick();
+      await settle(800);
+      note("zoomEnlarged", text("#host .fp-zoom-count"));
+      note("bubbleSuppressed", document.querySelector("#host .fp-pick") === null);
+      doubleClick();
+      await settle(800);
+      note("zoomRestored", text("#host .fp-zoom-count"));
+      doubleClick();
+      await settle(800);
+      note("zoomEnlargedAgain", text("#host .fp-zoom-count"));
+      // A double-click on the toolbar is not a page click: it must not zoom.
+      const before = text("#host .fp-zoom-count");
+      document.querySelector("#host .fp-toolbar").dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+      await settle(400);
+      note("toolbarDoubleClickKeptZoom", text("#host .fp-zoom-count") === before);
+    }
+
+    if (scenario === "copy") {
+      // What a copy hands the clipboard: the pane's own text, not the page markup.
+      //
+      // A synthetic `copy` cannot show that on its own — the data a *trusted*
+      // copy put there is what the browser's pasteboard machinery drives — so the
+      // two things measured here are what a synthetic event can honestly answer:
+      // that the pane claims the event (`defaultPrevented`) and that it writes
+      // only the plain flavour. The reflow rule itself is a string function and
+      // is measured directly by `tests/client-smoke.mjs`; `plainText` below is
+      // reported for the record and is Chromium's own serialisation of the
+      // selection, which is exactly the line-break-per-span text this replaces.
+      await until(() => document.querySelector("#host .fp-pages .textLayer span") !== null, 15000);
+      const spans = all("#host .fp-pages .textLayer span").filter((span) => (span.textContent ?? "").trim() !== "");
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.setStart(spans[0].firstChild, 0);
+      const last = spans[2] ?? spans[1] ?? spans[0];
+      range.setEnd(last.firstChild, last.firstChild.length);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      note("rawSelection", JSON.stringify(selection.toString()).slice(0, 110));
+      const event = new ClipboardEvent("copy", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: new DataTransfer(),
+      });
+      last.dispatchEvent(event);
+      const plain = event.clipboardData.getData("text/plain");
+      note("copyDefaultPrevented", event.defaultPrevented);
+      note("plainFlavourOnly", event.clipboardData.getData("text/html") === "");
+      note("plainText", JSON.stringify(plain).slice(0, 130));
+      note("transferIsBrowserFilled", plain === selection.toString());
+      // The same selection, copied outside the page area: the pane must leave it
+      // to the browser.
+      const outside = new ClipboardEvent("copy", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: new DataTransfer(),
+      });
+      document.querySelector("#host .fp-toolbar").dispatchEvent(outside);
+      note("outsideUntouched", !outside.defaultPrevented);
+      selection.removeAllRanges();
+    }
+
+    if (scenario === "find") {
+      click(DICT.find);
+      await until(() => document.querySelector("#host .fp-find-input") !== null, 4000);
+      type(document.querySelector("#host .fp-find-input"), "Page");
+      await until(() => (text("#host .fp-find-count") ?? "").includes("/"), 20000);
+      note("findCount", text("#host .fp-find-count"));
+      await until(() => all("#host .hl").length > 0, 8000);
+      // The wait exits on the first painted page, and a re-render can clear the
+      // layer again — so record the count over time instead of trusting one read.
+      const hlTimeline = [];
+      for (let tick = 0; tick < 8; tick += 1) {
+        await settle(250);
+        hlTimeline.push(all("#host .hl").length);
+      }
+      note("hlTimeline", hlTimeline.join(","));
+      note("highlights", all("#host .hl").length);
+      note("highlightPages", new Set(all("#host .hl").map((el) => el.closest(".page")?.dataset.pageNumber ?? "?")).size);
+      note("jumpedTo", pagesLabel());
+      click(DICT.findNext);
+      await settle(500);
+      note("afterNext", pagesLabel());
+      // Escape in the field is how the bar closes; the marks go with it.
+      document.querySelector("#host .fp-find-input")
+        .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await settle(600);
+      note("barClosed", document.querySelector("#host .fp-findbar") === null);
+      note("marksCleared", all("#host .hl").length);
+    }
+
+    if (scenario === "port") {
+      // The page readout, the two find switches, the properties card and a
+      // pinned translation, each measured on the pane itself.
+      const field = document.querySelector("#host .fp-page-input");
+      note("pageField", field !== null);
+      if (field !== null) {
+        field.focus();
+        type(field, "3");
+        field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+        await settle(800);
+        note("afterPageTyped", pagesLabel());
+        note("fieldShowsPage", field.isConnected ? field.value : null);
+      }
+
+      // Case: the sample's first line is "Page", so a lowercase query finds
+      // nothing until the switch is off again.
+      click(DICT.find);
+      await until(() => document.querySelector("#host .fp-find-input") !== null, 4000);
+      click(DICT.matchCase);
+      await settle(150);
+      type(document.querySelector("#host .fp-find-input"), "page");
+      await settle(1500);
+      note("caseOnCount", text("#host .fp-find-count"));
+      click(DICT.matchCase);
+      await until(() => /\//u.test(text("#host .fp-find-count") ?? ""), 20000);
+      note("caseOffCount", text("#host .fp-find-count"));
+      click(DICT.wholeWord);
+      await settle(1000);
+      note("wholeWordCount", text("#host .fp-find-count"));
+      click(DICT.wholeWord);
+      await settle(300);
+      document.querySelector("#host .fp-find-input")
+        .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await settle(400);
+      note("barClosed", document.querySelector("#host .fp-findbar") === null);
+
+      // Properties: the rows come from the document, not from the file name.
+      // The sheet lives in the overflow menu now, so opening it is two presses.
+      note("menuOpened", await openMore());
+      note("menuRows", all("#host .fp-menu-row").map((el) => el.textContent.trim()).join("|"));
+      const sheetRow = all("#host .fp-menu-row").find((el) => el.textContent.trim() === DICT.properties);
+      note("menuHasProperties", sheetRow !== undefined);
+      sheetRow?.click();
+      note("menuClosedOnPick", await until(() => document.querySelector("#host .fp-menu") === null, 2000));
+      note("panel", await until(() => document.querySelector("#host .fp-panel") !== null, 6000));
+      const rows = all("#host .fp-panel dt").map((el) => el.textContent.trim());
+      const values = {};
+      for (const el of all("#host .fp-panel dt")) values[el.textContent.trim()] = el.nextElementSibling?.textContent?.trim() ?? null;
+      note("propRows", rows.length);
+      note("propKeys", rows.slice(0, 4).join(","));
+      note("propFileName", values[DICT.fileName] ?? null);
+      note("propPageCount", values[DICT.documentPageCount] ?? null);
+      note("propPageSize", values[DICT.pageSize] ?? null);
+      click(DICT.close);
+      await settle(300);
+      note("panelClosed", document.querySelector("#host .fp-panel") === null);
+      // Escape is the other way out of the sheet, as it is for the password card.
+      await openMore();
+      all("#host .fp-menu-row").find((el) => el.textContent.trim() === DICT.properties)?.click();
+      await until(() => document.querySelector("#host .fp-panel") !== null, 6000);
+      document.querySelector("#host .fp-panel")
+        .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await settle(300);
+      note("panelEscape", document.querySelector("#host .fp-panel") === null);
+
+      // A pinned card keeps its place: the page's double-click no longer
+      // replaces it, and the head is a handle.
+      await until(() => document.querySelector("#host .fp-pages .textLayer span") !== null, 15000);
+      const span = document.querySelector("#host .fp-pages .textLayer span");
+      const picked = window.getSelection();
+      const pickedRange = document.createRange();
+      pickedRange.selectNodeContents(span);
+      picked.removeAllRanges();
+      picked.addRange(pickedRange);
+      document.querySelector("#host .fp-frame").dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      await until(() => document.querySelector("#host .fp-pick") !== null, 4000);
+      click(DICT.translate);
+      await until(() => document.querySelector("#host .fp-pick-text") !== null, 20000);
+      click(DICT.pin);
+      await settle(220);
+      note("pinned", document.querySelector("#host .fp-pick")?.hasAttribute("data-pinned") ?? false);
+      const before = document.querySelector("#host .fp-pick").getBoundingClientRect().left;
+      const head = document.querySelector("#host .fp-pick-head");
+      const box = head.getBoundingClientRect();
+      head.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true, cancelable: true, button: 0, clientX: box.left + 20, clientY: box.top + 8,
+      }));
+      window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: box.left + 62, clientY: box.top + 46 }));
+      window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+      await settle(260);
+      const after = document.querySelector("#host .fp-pick").getBoundingClientRect().left;
+      note("draggedBy", Math.round(after - before));
+      // The drag moves right by 42 px, so anything else means the clamp ate it.
+      note("dragBefore", Math.round(before));
+      document.querySelector("#host .fp-pages .page")
+        .dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+      await settle(500);
+      note("cardSurvivedDblclick", document.querySelector("#host .fp-pick-text") !== null);
+    }
+
+    if (scenario === "two") {
+      // Two document tabs at once. Everything the plugin registers is
+      // module-level — registry handle, stylesheets, the memoised viewer
+      // import — so this is where "shared" goes wrong.
+      const hostB = document.getElementById("host2");
+      const rootB = window.ReactDOM.createRoot(hostB);
+      const bytesB = await fetchBytes("./samples/plain.pdf");
+      const tabSignalB = new AbortController().signal;
+      rootB.render(window.React.createElement(Body, {
+        content: { kind: "bytes", data: bytesB },
+        resourceAddress: "file:///C:/docs/samples/plain.pdf",
+        t,
+        sessionId: "sess-47",
+        retainTab: (tabId, signal) => {
+          retained.push(`retain2:${tabId}`);
+          return injected.retainTab?.(tabId, signal) ?? (() => {});
+        },
+        useTabInfo: () => ({ tab: { id: "tab-body-b", signal: tabSignalB, contentId: "content-2" } }),
+        useStore: () => null,
+        actions: { forget: () => {} },
+        renderSlot: () => null,
+      }));
+      const bLabel = () => pagesLabelIn("#host2");
+      const bCanvasCount = () => all("#host2 .fp-pages canvas").length;
+      note("bReady", await until(() => bCanvasCount() > 0, 20000));
+      note("bSettled", await until(() => /\/\s*\d/u.test(bLabel() ?? ""), 20000));
+      note("aPages", pagesLabel());
+      note("bPages", bLabel());
+      note("aCanvases", all("#host .fp-pages canvas").length);
+      note("bCanvases", bCanvasCount());
+      note("retainedTabs", [...new Set(retained)].join("|") || "-");
+
+      // Find runs in pane A only.
+      click(DICT.find);
+      // `until` answers true/false, so the element is queried again after it.
+      note("aFindBar", await until(() => document.querySelector("#host .fp-find-input") !== null, 8000));
+      type(document.querySelector("#host .fp-find-input"), "Page");
+      note("aFind", await until(() => {
+        const value = text("#host .fp-find-count");
+        return value && value.includes("/") ? value : false;
+      }, 10000));
+      await settle(900);
+      note("aFindCount", text("#host .fp-find-count") ?? "-");
+      note("aHighlightPages", all("#host .page").filter((page) => page.querySelector(".hlLayer .hl") !== null).length);
+      note("aTextLayers", all("#host .textLayer").length);
+      note("aTextSpans", all("#host .textLayer span").length);
+      note("aHighlights", all("#host .hlLayer .hl").length);
+      note("aPageNow", pagesLabel());
+      note("aHlLayers", all("#host .hlLayer").length);
+      note("bFindBarDuringA", document.querySelector("#host2 .fp-find-input") !== null);
+
+      // Scroll both, then tear pane A down: pane B has to keep its place.
+      const frameA = document.querySelector("#host .fp-frame");
+      const frameB = document.querySelector("#host2 .fp-frame");
+      frameA.scrollTop = 2400;
+      frameB.scrollTop = 900;
+      await settle(600);
+      note("aScrollBefore", Math.round(frameA.scrollTop));
+      note("bScrollBefore", Math.round(frameB.scrollTop));
+      const bTopBefore = frameB.scrollTop;
+      root.render(null);
+      await settle(1000);
+      note("aGone", document.querySelector("#host .fp-pages canvas") === null);
+      note("bSurvives", bCanvasCount());
+      note("bScrollKept", Math.round(frameB.scrollTop) === Math.round(bTopBefore));
+      note("bLabelAfter", bLabel());
+      const bFindButton = all("#host2 button").find((b) => b.getAttribute("aria-label") === DICT.find);
+      note("bFindButton", bFindButton ? (bFindButton.disabled ? "disabled" : "enabled") : "missing");
+      bFindButton?.click();
+      note("bBarOpened", await until(() => document.querySelector("#host2 .fp-find-input") !== null, 6000));
+      const bBar = document.querySelector("#host2 .fp-find-input");
+      note("bBarConnected", bBar?.isConnected ?? false);
+      // Through `type`, not `.value = `: React's value tracker swallows a
+      // programmatic assignment, so the change never reaches the component.
+      if (bBar) type(bBar, "Lorem");
+      await until(() => (text("#host2 .fp-find-count") ?? "").includes("/"), 12000);
+      note("bFindCount", text("#host2 .fp-find-count") ?? "-");
+      await settle(900);
+      note("bHighlights", all("#host2 .hlLayer .hl").length);
+      note("bPageNow", bLabel());
+      note("aHighlightsGone", all("#host .hlLayer .hl").length);
+
+      // And pane A comes back with its reading place.
+      show(bytes, address);
+      note("aBack", await until(() => /\/\s*\d/u.test(pagesLabel() ?? ""), 20000));
+      note("aBackPage", pagesLabel());
+      note("aBackScrollTop", Math.round(document.querySelector("#host .fp-frame").scrollTop));
+      note("bStillThere", bLabel());
+      return;
+    }
+
+    if (scenario === "sweep") {
+      // Walk a long document from top to bottom. The renderer keeps a small
+      // cache of bitmaps; this is where that shows up as a number.
+      const frame = document.querySelector("#host .fp-frame");
+      await until(hasCanvas, 30000);
+      await settle(600);
+      const painted = () =>
+        all("#host .fp-pages .page").filter((page) => page.querySelector(".textLayer span") !== null).length;
+      const heap = () => Math.round(((performance.memory?.usedJSHeapSize ?? 0) / 1048576) * 10) / 10;
+      note("pages", all("#host .fp-pages .page").length);
+      note("startPainted", painted());
+      note("startHeapMB", heap());
+      const samples = [];
+      const steps = 24;
+      for (let index = 1; index <= steps; index += 1) {
+        frame.scrollTop = Math.round(((frame.scrollHeight - frame.clientHeight) * index) / steps);
+        await settle(320);
+        samples.push(`${pagesLabel().replace(" / ", "/")}:painted${painted()}:heap${heap()}`);
+      }
+      note("samples", samples.join(" | "));
+      note("endPainted", painted());
+      note("endHeapMB", heap());
+      note("labelAtEnd", pagesLabel());
+      // Back to the top: released pages have to come back on demand.
+      frame.scrollTop = 0;
+      await settle(900);
+      note("backAtTop", pagesLabel());
+      note("topRepainted", all("#host .fp-pages .page")[0]?.querySelector(".textLayer span") !== null);
+      note("afterReturnPainted", painted());
+      note("afterReturnHeapMB", heap());
+    }
+
+    if (scenario === "hotkey") {
+      // Ctrl+F has to reach the document's own finder, not the browser's: the
+      // page text lives in a canvas, so the browser would report no matches.
+      const frame = document.querySelector("#host .fp-frame");
+      frame.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      frame.focus();
+      note("frameFocused", document.activeElement === frame);
+      // React's synthetic dispatch makes `defaultPrevented` read false for a
+      // window listener even when the event was cancelled, so the answer comes
+      // from `dispatchEvent` itself: it returns false only if something called
+      // preventDefault.
+      // `dispatchEvent` answers false only when something cancelled the event.
+      const notCancelled = frame.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+      note("browserFindSuppressed", notCancelled === false);
+      await until(() => document.querySelector("#host .fp-find-input") !== null, 4000);
+      note("barOpened", document.querySelector("#host .fp-find-input") !== null);
+      note("inputFocused", document.activeElement === document.querySelector("#host .fp-find-input"));
+      type(document.querySelector("#host .fp-find-input"), "Page");
+      await until(() => (text("#host .fp-find-count") ?? "").includes("/"), 20000);
+      note("findCount", text("#host .fp-find-count"));
+      await until(() => all("#host .hl").length > 0, 8000);
+      note("highlights", all("#host .hl").length);
+      // The same chord with the bar already open must keep it open and refocus.
+      document.querySelector("#host .fp-find-input").blur();
+      frame.focus();
+      frame.dispatchEvent(new KeyboardEvent("keydown", { key: "F", ctrlKey: true, bubbles: true, cancelable: true }));
+      await settle(400);
+      note("stillOpen", document.querySelector("#host .fp-findbar") !== null);
+      note("refocused", document.activeElement === document.querySelector("#host .fp-find-input"));
+      // A plain "f" typed outside the field must not be swallowed.
+      const plainSeen = [];
+      const plain = (event) => plainSeen.push(event.defaultPrevented);
+      window.addEventListener("keydown", plain);
+      document.querySelector("#host .fp-toolbar").dispatchEvent(new KeyboardEvent("keydown", { key: "f", bubbles: true, cancelable: true }));
+      await settle(200);
+      note("plainNotSwallowed", plainSeen.every((value) => value === false));
+      window.removeEventListener("keydown", plain);
+    }
+
+    if (scenario === "outline" || scenario === "history") {
+      const hasOutline = await until(() => all("#host button").some((b) => b.getAttribute("aria-label") === DICT.outline), 12000);
+      note("hasOutlineButton", hasOutline);
+      if (hasOutline) {
+        const frameWidth = () => Math.round(document.querySelector("#host .fp-frame").getBoundingClientRect().width);
+        const frameWidthClosed = frameWidth();
+        click(DICT.outline);
+        await until(() => all("#host .fp-outline-row").length > 0, 4000);
+        note("outlineRows", all("#host .fp-outline-row").length);
+        // The outline is an overlay: the page must keep its width while it is open.
+        note("frameWidthClosed", frameWidthClosed);
+        note("frameWidthOpen", frameWidth());
+        const panelBox = document.querySelector("#host .fp-outline")?.getBoundingClientRect();
+        const frameBox = document.querySelector("#host .fp-frame")?.getBoundingClientRect();
+        note("outlineOverFrame", panelBox !== undefined && frameBox !== undefined
+          && panelBox.left < frameBox.right && panelBox.right > frameBox.left
+          && panelBox.top < frameBox.bottom && panelBox.bottom > frameBox.top);
+        // Folding: one caret, then the two all-or-nothing buttons. Rows under a
+        // folded branch stay in the DOM now — the branch animates its height to
+        // zero instead of being removed — so "on screen" means "not inside a
+        // folded branch".
+        const items = () => all("#host .fp-outline-item")
+          .filter((el) => el.closest(".fp-outline-kids[data-folded]") === null).length;
+        note("outlineItems", items());
+        const caret = document.querySelector("#host .fp-outline-item .fp-outline-caret[aria-expanded]");
+        note("firstCaret", caret !== null);
+        if (caret !== null) {
+          // The branch has to be seen closing, not just be closed afterwards.
+          const branch = caret.closest(".fp-outline-node")?.querySelector(".fp-outline-kids") ?? null;
+          const height = () => (branch === null ? -1 : Math.round(branch.getBoundingClientRect().height));
+          note("branchTransition", branch === null ? null : getComputedStyle(branch).transitionDuration);
+          note("branchOpenHeight", height());
+          caret.click();
+          await settle(50);
+          note("branchMidHeight", height());
+          await settle(400);
+          note("branchFoldedHeight", height());
+          note("afterOneFold", items());
+          click(DICT.collapseAll);
+          await settle(400);
+          note("afterCollapseAll", items());
+          click(DICT.expandAll);
+          await settle(400);
+          note("afterExpandAll", items());
+        }
+        // The chapter highlight follows the reading point; at the top of the
+        // document that is the first entry.
+        note("activeRow", document.querySelector("#host .fp-outline-item[data-active] .fp-outline-row")?.textContent?.trim() ?? null);
+        const last = all("#host .fp-outline-row").at(-1);
+        note("lastRow", last?.textContent?.trim());
+        last.click();
+        await settle(800);
+        note("afterJump", pagesLabel());
+        // The highlight has to be somewhere after the jump: page 1 of this sample
+        // is above the first outline entry, so it is empty there by design.
+        note("activeAfterJump", document.querySelector("#host .fp-outline-item[data-active] .fp-outline-row")?.textContent?.trim() ?? null);
+        const back = all("#host button").find((b) => b.getAttribute("aria-label") === DICT.historyBack);
+        note("backEnabled", back !== undefined && !back.disabled);
+        back.click();
+        await settle(800);
+        note("afterBack", pagesLabel());
+        const forward = all("#host button").find((b) => b.getAttribute("aria-label") === DICT.historyForward);
+        note("forwardEnabled", forward !== undefined && !forward.disabled);
+        forward.click();
+        await settle(800);
+        note("afterForward", pagesLabel());
+      }
+    }
+
+    if (scenario === "place") {
+      // Read somewhere, tear the pane down, open it again: it should come back
+      // to the same page at the same offset.
+      for (let i = 0; i < 4; i += 1) {
+        click(DICT.next);
+        await settle(280);
+      }
+      await settle(700);
+      note("beforeLeave", pagesLabel());
+      const frame0 = document.querySelector("#host .fp-frame");
+      note("beforeScrollTop", Math.round(frame0.scrollTop));
+      note("beforeScrollHeight", Math.round(frame0.scrollHeight));
+      note("beforeZoom", text("#host .fp-zoom-count"));
+      root.render(null);
+      await settle(800);
+      note("unmounted", document.querySelector("#host .fp-pages") === null);
+      show(bytes, address);
+      // Tight timeline: did the restore land and get undone, or never land?
+      const timeline = [];
+      let last = "-";
+      const startedAt = Date.now();
+      for (let i = 0; i < 60; i += 1) {
+        const frame = document.querySelector("#host .fp-frame");
+        const now = frame === null ? "none" : `${Math.round(frame.scrollTop)}/${Math.round(frame.scrollHeight)}`;
+        if (now !== last) {
+          timeline.push(`${Date.now() - startedAt}ms:${now}`);
+          last = now;
+        }
+        await settle(50);
+      }
+      note("timeline", timeline.slice(0, 14).join(" "));
+      note("coreSawSaved", window.__saved ?? "-");
+      note("stateLogTail", (window.__stateLog ?? []).slice(-6).join(" "));
+      note("stateLogSawTarget", (window.__stateLog ?? []).some((l) => l.endsWith("/2111")));
+      note("placeLog", (window.__placeLog ?? []).join(" "));
+      note("coreSawRestore", window.__restore ?? "-");
+      await until(hasCanvas, 25000);
+      await settle(400);
+      note("afterRemount", pagesLabel());
+      note("afterScrollTop", Math.round(document.querySelector("#host .fp-frame").scrollTop));
+      note("afterZoom", text("#host .fp-zoom-count"));
+    }
+
+    if (scenario === "perf") {
+      // What does opening one PDF actually cost? Bytes off the route, and the
+      // time until the first page is painted.
+      const startedAt = performance.now();
+      await until(hasCanvas, 30000);
+      const firstCanvasMs = Math.round(performance.now() - startedAt);
+      await settle(600);
+      const assets = performance
+        .getEntriesByType("resource")
+        .filter((entry) => entry.name.includes("/fast-pdf/"))
+        .map((entry) => ({
+          path: entry.name.split("/fast-pdf/")[1] ?? entry.name,
+          bytes: Math.round((entry.encodedBodySize ?? 0) / 1024),
+          ms: Math.round(entry.duration ?? 0),
+        }));
+      const totalKB = assets.reduce((sum, entry) => sum + entry.bytes, 0);
+      // How many pages did the renderer actually paint? A 200-page document must
+      // not paint 200 canvases at once.
+      const pageEls = all("#host .fp-pages .page");
+      const painted = pageEls.filter((page) => page.querySelector(".textLayer span") !== null).length;
+      note("pages", pageEls.length);
+      note("painted", painted);
+      note("firstCanvasMs", firstCanvasMs);
+      note("assetCount", assets.length);
+      note("assetKB", totalKB);
+      note("assetList", assets.sort((a, b) => b.bytes - a.bytes).map((entry) => `${entry.path}:${entry.bytes}KB/${entry.ms}ms`).join(" "));
+      // Jump to the end of a long document: the frames are all there, but the
+      // painted set must stay small while the scroll position moves.
+      const frame = document.querySelector("#host .fp-frame");
+      const jumpStart = performance.now();
+      frame.scrollTop = frame.scrollHeight;
+      await settle(1200);
+      note("scrollToEndMs", Math.round(performance.now() - jumpStart));
+      note("labelAtEnd", pagesLabel());
+      const paintedAtEnd = all("#host .fp-pages .page").filter(
+        (page) => page.querySelector(".textLayer span") !== null,
+      ).length;
+      note("paintedAtEnd", paintedAtEnd);
+      note("scrollHeightAtEnd", Math.round(frame.scrollHeight));
+
+      const nav = performance.getEntriesByType("navigation")[0];
+      note("domContentLoadedMs", nav === undefined ? "-" : Math.round(nav.domContentLoadedEventEnd));
+      note("loadEventMs", nav === undefined ? "-" : Math.round(nav.loadEventEnd));
+    }
+
+    if (scenario === "recycle") {
+      // Open and shut the pane repeatedly. Nothing should accumulate: no canvas
+      // left behind by a closed viewer, no heap climbing cycle after cycle.
+      await until(hasCanvas, 25000);
+      await settle(400);
+      const heapMB = () => (performance.memory === undefined
+        ? -1
+        : Math.round((performance.memory.usedJSHeapSize / 1048576) * 10) / 10);
+      const canvases = [];
+      const heap = [heapMB()];
+      const pages = [];
+      for (let i = 0; i < 6; i += 1) {
+        root.render(null);
+        await settle(600);
+        canvases.push(all("#host .fp-pages canvas").length);
+        heap.push(heapMB());
+        show(bytes, address);
+        await until(hasCanvas, 25000);
+        await settle(500);
+        pages.push((pagesLabel() ?? "").trim());
+      }
+      note("canvasesAfterUnmount", canvases.join(","));
+      note("heapMB", heap.join(","));
+      note("heapGrowthMB", `${(heap[heap.length - 1] - heap[0]).toFixed(1)} over ${heap.length - 1} cycles`);
+      note("pagesEachCycle", pages.join("|"));
+      note("liveCanvases", all("#host .fp-pages canvas").length);
+      note("liveFrames", all("#host .fp-frame").length);
+    }
+
+    if (scenario === "switch") {
+      // Same tab, another document: the effect has to reopen, not repaint.
+      // The target has to be a *different* file with a *different* page count —
+      // this block used to fetch `outline.pdf` and then wait for the label to
+      // end in "/ 10", which outline.pdf (12 pages) never does, so it timed out
+      // and measured nothing on every run.
+      note("beforeSwitch", pagesLabel());
+      const target = source.includes("plain") ? "./samples/outline.pdf" : "./samples/plain.pdf";
+      const expected = target.includes("plain") ? "/ 4" : "/ 12";
+      const next = await fetchBytes(target);
+      // The route reads from disk, so the disk target has to move with it —
+      // otherwise the pane re-reads the file it already had and nothing switches.
+      const targetDisk = disk === null
+        ? null
+        : String(disk).replace(/[^\\/]*$/u, "") + target.replace(/^\.\/samples\//u, "");
+      show(next, `file:///C:/docs/${target.replace(/^\.\//u, "")}`, targetDisk);
+      note("switched", await until(() => (pagesLabel() ?? "").endsWith(expected), 30000));
+      note("afterSwitch", pagesLabel());
+      note("canvasesAfter", all("#host .fp-pages canvas").length);
+      note("scrollResetAfterSwitch", Math.round(document.querySelector("#host .fp-frame").scrollTop));
+    }
+
+    if (scenario === "select") {
+      await until(() => document.querySelector("#host .fp-pages .textLayer span") !== null, 15000);
+      const span = document.querySelector("#host .fp-pages .textLayer span");
+      note("textSpan", span?.textContent?.slice(0, 24) ?? "none");
+      const selection = window.getSelection();
+      // A range inside the text, not around the span: an element-level focus has
+      // no caret to measure, and the bubble is anchored to a caret.
+      const choose = (node) => {
+        if (node === null || node === undefined) return;
+        // The characters, and the pointer's landing point: a page that redrew
+        // under the hand leaves the range without rects, and the pointer is the
+        // pane's fallback anchor (`anchorOf`). An empty text node at the head of
+        // a span would make the range carry nothing at all.
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        let text = null;
+        while (walker.nextNode() !== null) {
+          if (walker.currentNode.length > 0) {
+            text = walker.currentNode;
+            break;
+          }
+        }
+        text = text ?? (node.firstChild?.nodeType === 3 ? node.firstChild : node);
+        const range = document.createRange();
+        range.setStart(text, 0);
+        range.setEnd(text, (text.textContent ?? "").length);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        const box = node.getBoundingClientRect();
+        document.querySelector("#host .fp-frame").dispatchEvent(new MouseEvent("mouseup", {
+          bubbles: true,
+          clientX: Math.round(box.right - 2),
+          clientY: Math.round(box.top + box.height / 2),
+        }));
+      };
+      choose(span);
+      // 开页收尾时版面还要重建一次文本层，重建会把选区一起带走：等它定下来再划词，
+      // 这一刻量的才是气泡，而不是跟排版抢时间。
+      if (!(await until(() => document.querySelector("#host .fp-chip") !== null, 1200))) {
+        await settle(500);
+        choose(span);
+      }
+      // The pill is `.fp-chip` and the card it opens is `.fp-pick`; they are two
+      // elements with two lifetimes, so a pinned card can outlive the pill.
+      note("pickShown", await until(() => document.querySelector("#host .fp-chip") !== null, 4000));
+      note("pickAction", text("#host .fp-pick-action"));
+      // The pill floats over the paper, so its own surface has to be opaque. The
+      // hover wash is layered on top by `background-image`, which a synthetic
+      // event cannot trigger — `client-smoke.mjs` holds that shape; here the
+      // question is only whether the resting surface is a solid colour.
+      {
+        const style = getComputedStyle(document.querySelector("#host .fp-pick-action"));
+        note("pickSurface", `${style.backgroundColor} / ${style.backgroundImage.slice(0, 18)}`);
+        note("pickSurfaceOpaque", !/rgba\([^)]*,\s*0?\.\d+\)/u.test(style.backgroundColor));
+      }
+      click("翻译");
+      note("translated", await until(() => (text("#host .fp-pick-text") ?? "").length > 0, 15000));
+      note("pickText", (text("#host .fp-pick-text") ?? "-").slice(0, 40));
+      note("pickModel", text("#host .fp-pick-model"));
+      let body = null;
+      try { body = JSON.parse(window.__translateBody ?? "null"); } catch { body = "unparsed"; }
+      note("requestedChars", body?.text?.length ?? "-");
+      note("requestedSession", body?.sessionId ?? "-");
+      note("routeStatus", window.__translateStatus ?? "-");
+      note("routeRaw", (window.__translateRaw ?? "-").slice(0, 90));
+      note("sentHeader", String(window.__translateHeaders?.["x-dsh-fast-pdf"] ?? window.__translateHeaders?.get?.("x-dsh-fast-pdf") ?? "-"));
+
+      /** Is the card inside the pane it floats over? */
+      const cardFits = (tag) => {
+        const rootBox = document.querySelector("#host .fp-root").getBoundingClientRect();
+        const cardBox = document.querySelector("#host .fp-pick-card")?.getBoundingClientRect();
+        if (cardBox === undefined) {
+          note(`${tag}Card`, "none");
+          return;
+        }
+        note(`${tag}Inside`, cardBox.left >= rootBox.left - 1 && cardBox.right <= rootBox.right + 1
+          && cardBox.top >= rootBox.top - 1 && cardBox.bottom <= rootBox.bottom + 1);
+        note(`${tag}Rect`, [cardBox.left, cardBox.top, cardBox.width, cardBox.height].map(Math.round).join(","));
+        // Flipped or not, read off the boxes: the card hangs under the words when
+        // it starts below them, above them when it does not fit below. Measured
+        // against the focus end, which is what the bubble is anchored to.
+        const anchorBox = focusEndBox(window.getSelection());
+        if (anchorBox === null) {
+          note(`${tag}Flipped`, "no-selection");
+        } else {
+          note(`${tag}Below`, Math.round(cardBox.top - anchorBox.bottom));
+          note(`${tag}Above`, Math.round(anchorBox.top - cardBox.bottom));
+          note(`${tag}Flipped`, cardBox.top < anchorBox.top);
+        }
+      };
+      // The card keeps growing after its first paint (the text lands, the quote
+      // block opens), and its height is what decides above-or-below — so let it
+      // settle before asking where it ended up.
+      await settle(400);
+      cardFits("first");
+
+      // The copy button is the one thing in the card that touches the clipboard.
+      click("复制");
+      await settle(500);
+      note("copiedLabel", text("#host .fp-pick-foot button"));
+
+      // Now a selection at the bottom of the last page, where a card has no room
+      // below it.
+      const frame = document.querySelector("#host .fp-frame");
+      frame.scrollTop = frame.scrollHeight;
+      await settle(900);
+      const tail = [...document.querySelectorAll("#host .fp-pages .textLayer span")].at(-1);
+      if (tail === undefined) {
+        note("bottomSpans", "none");
+      } else {
+        tail.scrollIntoView({ block: "end" });
+        await settle(400);
+        choose(tail);
+        await settle(300);
+        click("翻译");
+        // The pill's press reaches the card one task later, so the *previous*
+        // card's body satisfies a naive wait and the read that follows lands on
+        // the busy card, where .fp-pick-text is not rendered at all — that is
+        // how tailText=- was reported. Wait for busy, then for done.
+        await until(() => document.querySelector("#host .fp-pick")?.getAttribute("data-status") === "busy", 2000);
+        await until(() => document.querySelector("#host .fp-pick")?.getAttribute("data-status") === "done", 15000);
+        note("tailText", (text("#host .fp-pick-text") ?? "-").slice(0, 24));
+        note("tailModel", text("#host .fp-pick-model"));
+        await settle(400);
+        cardFits("bottom");
+      }
+      note("documentScrollWidth", document.documentElement.scrollWidth);
+      note("documentClientWidth", document.documentElement.clientWidth);
+    }
+
+    if (scenario === "anchor") {
+      // Where the pill hangs. The pill must follow the *focus* end of the
+      // selection — the end the pointer last touched — not the union box of a
+      // multi-line selection, which is what put it far away from the words.
+      await until(() => all("#host .fp-pages .textLayer span").length >= 4, 15000);
+      const spans = all("#host .fp-pages .textLayer span").filter((s) => (s.textContent ?? "").trim().length > 3);
+      const frame = document.querySelector("#host .fp-frame");
+      if (spans.length < 3) {
+        note("spans", spans.length);
+      } else {
+        // The focus end, measured without the plugin's own helper: a collapsed
+        // range at the focus, or the last character before it when that is empty.
+        const pick = async (backward) => {
+          // Press on the page first: a click dismisses whatever is showing.
+          frame.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 5, clientY: 5 }));
+          await settle(120);
+          const start = spans[0];
+          const end = spans[2];
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.setStart(start.firstChild, 0);
+          range.setEnd(end.firstChild, Math.min(6, end.textContent.length));
+          selection.removeAllRanges();
+          selection.addRange(range);
+          if (backward) {
+            // A drag from the end back to the start: the focus is at the top.
+            selection.collapse(end.firstChild, 1);
+            selection.extend(start.firstChild, 2);
+          }
+          frame.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+          const shown = await until(() => document.querySelector("#host .fp-chip") !== null, 4000);
+          await settle(150);
+          const box = document.querySelector("#host .fp-chip")?.getBoundingClientRect();
+          const focus = focusEndBox(window.getSelection());
+          return { shown, box, focus };
+        };
+        const report = (tag, result) => {
+          note(`${tag}Shown`, result.shown);
+          if (result.box === undefined || result.box === null || result.focus === null) return;
+          note(`${tag}Pill`, [result.box.left, result.box.top, result.box.width, result.box.height].map(Math.round).join(","));
+          note(`${tag}Focus`, [result.focus.left, result.focus.right, result.focus.top, result.focus.bottom].map(Math.round).join(","));
+          // Below the anchor and within a gap of it: 8 px is the placement gap,
+          // so a few pixels of slack either side.
+          note(`${tag}BelowAnchor`, Math.round(result.box.top - result.focus.bottom));
+          note(`${tag}FromAnchor`, Math.round(result.box.left - result.focus.left));
+        };
+        note("spanCount", spans.length);
+        report("forward", await pick(false));
+        // A press on the page puts the pill away — the same press that starts
+        // the next selection.
+        frame.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 5, clientY: 5 }));
+        note("pillGoneOnPress", await until(() => document.querySelector("#host .fp-chip") === null, 2000));
+        // Backwards last: the screenshot this run saves is the pill hanging at
+        // the top end of the selection.
+        report("backward", await pick(true));
+      }
+    }
+
+    if (scenario === "menu") {
+      // The ⋯ opens over the paper and stays put: one row, on the right, under
+      // the button that opened it. Left open here on purpose — the screenshot
+      // this run saves is the picture of it.
+      await until(() => all("#host button").some((b) => b.getAttribute("aria-label") === DICT.more), 15000);
+      await settle(400);
+      note("opened", await openMore());
+      const moreBox = all("#host button").find((b) => b.getAttribute("aria-label") === DICT.more).getBoundingClientRect();
+      const menuBox = document.querySelector("#host .fp-menu")?.getBoundingClientRect();
+      const rootBox = document.querySelector("#host .fp-root").getBoundingClientRect();
+      note("menuRect", menuBox === undefined ? "none" : [menuBox.left, menuBox.top, menuBox.width, menuBox.height].map(Math.round).join(","));
+      note("menuUnderButton", menuBox !== undefined && menuBox.top >= moreBox.bottom - 1);
+      note("menuRightAligned", menuBox !== undefined && Math.abs(menuBox.right - moreBox.right) <= 1);
+      note("menuInsidePane", menuBox !== undefined && menuBox.left >= rootBox.left && menuBox.right <= rootBox.right + 1);
+      note("rowCount", all("#host .fp-menu-row").length);
+      const more = all("#host button").find((b) => b.getAttribute("aria-label") === DICT.more);
+      note("expanded", more.getAttribute("aria-expanded"));
+      note("haspopup", more.getAttribute("aria-haspopup"));
+      note("pressed", more.getAttribute("aria-pressed"));
+    }
+
+    if (scenario === "defects") {
+      // One pass over the seven things the reader reported, each measured on the
+      // pane rather than argued about in the source. Every fact here failed
+      // before the fix it belongs to.
+      await until(() => hasCanvas(), 25000);
+      await settle(400);
+      const root = () => document.querySelector("#host .fp-root");
+      const rootBox = () => root().getBoundingClientRect();
+
+      // 1 + 2 + 6: the outline's head, its corners, and where its highlight
+      // starts. `&paneH=300` is what makes the tree overflow its column.
+      click(DICT.outline);
+      await until(() => all("#host .fp-outline-row").length > 0, 5000);
+      click(DICT.expandAll);
+      await settle(400);
+      const panel = document.querySelector("#host .fp-outline");
+      const list = panel.querySelector(".fp-outline-list");
+      const headBox = () => panel.querySelector(".fp-outline-head").getBoundingClientRect();
+      note("outlineHasHead", panel.querySelector(".fp-outline-head") !== null);
+      note("outlineListScrolls", list !== null && list.scrollHeight > list.clientHeight + 4);
+      const headTop = Math.round(headBox().top);
+      note("headTopBefore", headTop);
+      const firstRowTop = Math.round(panel.querySelector(".fp-outline-row").getBoundingClientRect().top);
+      if (list !== null) list.scrollTop = 120;
+      await settle(250);
+      note("headTopAfterScroll", Math.round(headBox().top));
+      // The head is fixed: 120px of tree went by under it and it did not move.
+      note("headStayedPut", Math.round(headBox().top) === headTop);
+      note("rowsMovedUnderHead", Math.round(panel.querySelector(".fp-outline-row").getBoundingClientRect().top) < firstRowTop);
+      note("outlineRadius", ["border-top-right-radius", "border-bottom-right-radius"]
+        .map((name) => getComputedStyle(panel).getPropertyValue(name).trim()).join("|"));
+      note("panelOverflow", getComputedStyle(panel).overflow);
+
+      // The highlight has to start where the row's own title starts, at any
+      // depth: a rule at the column's edge marks the column, not the chapter.
+      // The first page's chapter is a top-level entry, so the measurement needs a
+      // chapter that is nested — walk into one and let it become active.
+      const indentOf = (item) => parseFloat(item.style.getPropertyValue("--fp-indent"));
+      const nestedItem = all("#host .fp-outline-item").filter((item) => indentOf(item) > 4)[0] ?? null;
+      note("hasNestedRow", nestedItem !== null);
+      if (nestedItem !== null) {
+        const before = pagesLabel();
+        nestedItem.querySelector(".fp-outline-row").click();
+        await until(() => pagesLabel() !== before, 8000);
+        await settle(500);
+      }
+      const active = all("#host .fp-outline-item[data-active]")[0] ?? null;
+      note("hasActiveRow", active !== null);
+      note("activeIndent", active === null ? "none" : String(indentOf(active)));
+      // Read the pseudo-element the rule is drawn by: an inset box-shadow paints
+      // on the row's padding box whatever the padding is, and cannot be read back.
+      const ink = active === null ? null : getComputedStyle(active, "::before");
+      note("activeUsesPseudo", ink !== null && ink.content !== "none" && getComputedStyle(active).backgroundImage === "none");
+      note("accentStart", ink === null ? "none" : (ink.insetInlineStart || ink.left));
+      note("accentRule", ink === null || ink.boxShadow === "none" ? "none" : "set");
+      // The rule follows the indent rather than sitting at the column's edge.
+      note("accentFollowsIndent", active !== null && parseFloat(ink.insetInlineStart || ink.left) === indentOf(active)
+        && indentOf(active) > 2);
+      if (list !== null) list.scrollTop = 0;
+      click(DICT.outline);
+      await settle(300);
+
+      // 7: the page readout. Where the digits sit, and whether they stay put.
+      const box = document.querySelector("#host .fp-pageno").getBoundingClientRect();
+      const field = document.querySelector("#host .fp-page-input").getBoundingClientRect();
+      const prev = all("#host button").find((b) => b.getAttribute("aria-label") === DICT.previous).getBoundingClientRect();
+      const next = all("#host button").find((b) => b.getAttribute("aria-label") === DICT.next).getBoundingClientRect();
+      note("pagerAlign", getComputedStyle(document.querySelector("#host .fp-page-input")).textAlign);
+      note("pagerGapIn", Math.round(field.right - prev.right));
+      note("pagerGapOut", Math.round(next.left - box.right));
+      note("pagerCentred", Math.abs((box.left + box.right) / 2 - (prev.right + next.left) / 2) <= 2);
+      note("pagerTotal", text("#host .fp-pages-total"));
+
+      // Two presses of 下一页: the label may only ever go up. Before the fix it
+      // read 1 → 2 → 1 → 2, because the scroll handler reported the frames on
+      // the way as well as the destination.
+      const seen = [];
+      const watch = () => seen.push(document.querySelector("#host .fp-page-input")?.value ?? "");
+      watch();
+      const ticker = setInterval(watch, 16);
+      click(DICT.next);
+      await settle(600);
+      click(DICT.next);
+      await settle(900);
+      clearInterval(ticker);
+      const series = seen.join(">").replace(/([^>]+)(>\1)+/gu, "$1");
+      const steps = series.split(">").map(Number);
+      note("pagerSeries", series);
+      note("pagerBacktracks", steps.filter((value, at) => at > 0 && value < steps[at - 1]).length);
+      note("pagerAfterTwo", pagesLabel());
+
+      // Up and down inside the field, and a typed page that is only committed
+      // when the reader leaves the box.
+      const input = document.querySelector("#host .fp-page-input");
+      input.focus();
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true }));
+      await settle(700);
+      note("pagerArrowUp", pagesLabel());
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+      await settle(700);
+      note("pagerArrowDown", pagesLabel());
+      // A page typed into the box is a draft until the reader leaves it. The box
+      // shows the draft either way, so the difference is read off the frame's
+      // scroll position — that moves when the page is actually committed.
+      const frameTop = () => Math.round(document.querySelector("#host .fp-frame").scrollTop);
+      const topBeforeTyping = frameTop();
+      type(input, "7");
+      await settle(400);
+      note("pagerDraftShown", document.querySelector("#host .fp-page-input")?.value);
+      note("pagerDraftNotCommitted", frameTop() === topBeforeTyping);
+      input.blur();
+      await settle(900);
+      note("pagerBlurCommits", pagesLabel());
+      note("pagerBlurScrolled", frameTop() !== topBeforeTyping);
+
+      // 3: the 关闭 tooltip on the properties sheet. Only two things are
+      // measurable from this side, and they are the two that are ours: the
+      // sheet's × carries no tooltip wrapper any more (the Host's tooltip was
+      // what landed at the far right and dragged a scrollbar in with it), and the
+      // pane cannot become a horizontal scroller whatever a Host component
+      // renders inside it.
+      await openMore();
+      all("#host .fp-menu-row").find((el) => el.textContent.trim() === DICT.properties)?.click();
+      await until(() => document.querySelector("#host .fp-panel") !== null, 6000);
+      await settle(200);
+      const panelClose = document.querySelector("#host .fp-panel .fp-pick-close");
+      const closeBox = panelClose.getBoundingClientRect();
+      // Hovered and focused, which is when the Host would have shown it.
+      for (const kind of ["pointerover", "mouseover", "pointerenter", "mouseenter"]) {
+        panelClose.dispatchEvent(new MouseEvent(kind, {
+          bubbles: true, clientX: closeBox.left + 6, clientY: closeBox.top + 6,
+        }));
+      }
+      panelClose.focus();
+      await settle(700);
+      note("sheetCloseRight", Math.round(rootBox().right - closeBox.right));
+      note("sheetCloseTipWrap", panelClose.closest(".fp-tip") !== null);
+      note("sheetCloseLabel", panelClose.getAttribute("aria-label"));
+      note("rootOverflowX", getComputedStyle(root()).overflowX);
+      // Not a scroller: scroll width equals client width with the sheet open and
+      // its × hovered.
+      note("paneNoHScroll", root().scrollWidth <= root().clientWidth + 1);
+      note("paneScroll", `${root().scrollWidth}/${root().clientWidth}`);
+
+      // 4 + 5: the pin. Its glyph changes, the card says so too, and a pinned
+      // card no longer swallows the next selection's 翻译.
+      document.querySelector("#host .fp-panel")
+        .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await settle(300);
+      await until(() => document.querySelector("#host .fp-pages .textLayer span") !== null, 15000);
+      const pickWord = (node) => {
+        if (node === null || node === undefined) return;
+        // The first char-carrying text node: a span can start with an empty one,
+        // and a page still being laid out can be empty altogether.
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        let textNode = null;
+        while (walker.nextNode() !== null) {
+          if (walker.currentNode.length > 0) {
+            textNode = walker.currentNode;
+            break;
+          }
+        }
+        if (textNode === null) return;
+        const range = document.createRange();
+        range.setStart(textNode, 0);
+        range.setEnd(textNode, Math.min(12, textNode.length));
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        const box = node.getBoundingClientRect();
+        document.querySelector("#host .fp-frame").dispatchEvent(new MouseEvent("mouseup", {
+          bubbles: true,
+          clientX: Math.round(box.right - 2),
+          clientY: Math.round(box.top + box.height / 2),
+        }));
+      };
+      const spans = () => all("#host .fp-pages .textLayer span");
+      pickWord(spans()[0]);
+      if (!(await until(() => document.querySelector("#host .fp-chip") !== null, 1200))) {
+        await settle(500);
+        pickWord(spans()[0]);
+      }
+      note("chipAppears", await until(() => document.querySelector("#host .fp-chip") !== null, 4000));
+      click(DICT.translate);
+      await until(() => document.querySelector("#host .fp-pick-text") !== null, 20000);
+      const pin = () => document.querySelector("#host .fp-pick .fp-pin");
+      const glyph = () => pin()?.querySelector("path")?.getAttribute("d") ?? "none";
+      const card = () => document.querySelector("#host .fp-pick-card");
+      const glyphBefore = glyph();
+      const glyphFillBefore = pin()?.querySelector("path")?.getAttribute("fill");
+      const shadowBefore = getComputedStyle(card()).boxShadow;
+      note("pinLabelBefore", pin()?.getAttribute("aria-label"));
+      pin().click();
+      await settle(350);
+      note("pinLabelAfter", pin()?.getAttribute("aria-label"));
+      note("pinPressed", pin()?.getAttribute("aria-pressed"));
+      // One pin in two fills, not two pictures: the pinned state used to be a
+      // filled triangle over a stem, which reads as an up arrow, not a pin.
+      note("pinGlyphChanged", glyph() !== glyphBefore);
+      note("pinGlyphFill", pin()?.querySelector("path")?.getAttribute("fill"));
+      note("pinGlyphFillBefore", glyphFillBefore);
+      note("pinOneSilhouette", glyph() === glyphBefore);
+      note("pinOnlyFillChanges", glyph() === glyphBefore
+        && glyphFillBefore !== pin()?.querySelector("path")?.getAttribute("fill"));
+      note("pinCardRing", getComputedStyle(card()).boxShadow !== shadowBefore);
+      note("pinCardFlag", document.querySelector("#host .fp-pick")?.hasAttribute("data-pinned") === true);
+
+      // While that card is pinned, a selection elsewhere still offers 翻译, and
+      // pressing it fills the same card instead of being ignored.
+      pickWord(spans()[1] ?? spans()[0]);
+      note("chipWhilePinned", await until(() => document.querySelector("#host .fp-chip") !== null, 4000));
+      note("cardKeptWhileChipUp", document.querySelector("#host .fp-pick") !== null);
+      click(DICT.translate);
+      await settle(1500);
+      note("cardsOnScreen", document.querySelectorAll("#host .fp-pick").length);
+      note("cardReusedByChip", document.querySelectorAll("#host .fp-pick").length === 1
+        && document.querySelector("#host .fp-pick-text") !== null);
+      note("chipGoneAfterUse", document.querySelector("#host .fp-chip") === null);
+    }
+
+    if (scenario === "translate-error") {
+      await until(() => document.querySelector("#host .fp-pages .textLayer span") !== null, 15000);
+      const span = document.querySelector("#host .fp-pages .textLayer span");
+      const range = document.createRange();
+      range.selectNodeContents(span);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.querySelector("#host .fp-frame").dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      await until(() => document.querySelector("#host .fp-pick") !== null, 4000);
+      const okFetch = window.fetch;
+      window.fetch = async (input, init) => (String(input).includes("/fast-pdf/translate")
+        ? new Response(JSON.stringify({ ok: false, message: "找不到这个会话正在用的模型" }), { status: 200 })
+        : okFetch(input, init));
+      click("翻译");
+      note("errorState", await until(
+        () => (document.querySelector("#host .fp-pick")?.getAttribute("data-status") ?? "") === "error",
+        15000,
+      ));
+      note("errorText", text("#host .fp-pick-title"));
+      note("footButtons", all("#host .fp-pick-foot button").length);
+      note("pickStillOpen", document.querySelector("#host .fp-pick") !== null);
+      // The failed card offers its own way back: one 重试 in the footer, enabled.
+      const retry = all("#host .fp-pick-foot button").find((b) => b.textContent.trim() === DICT.retry) ?? null;
+      note("retryLabel", retry === null ? "none" : retry.textContent.trim());
+      note("canRetry", retry !== null && !retry.disabled);
+      // Pressing it really calls again, and into the same card: the route is
+      // healthy this time, so the card has to end up holding a translation
+      // rather than staying in the failed state. (Sampling for the transient
+      // 翻译中 status raced the answer; the outcome does not.)
+      if (retry !== null) {
+        window.fetch = okFetch;
+        retry.click();
+        note("retrySucceeds", await until(
+          () => (document.querySelector("#host .fp-pick")?.getAttribute("data-status") ?? "") === "done",
+          15000,
+        ));
+        note("retrySameCard", document.querySelectorAll("#host .fp-pick").length === 1);
+        note("retryErrorGone", (text("#host .fp-pick-text") ?? "").length > 0);
+      }
+    }
+
+    if (scenario === "password-card") {
+      await until(() => document.querySelector("#host .fp-password form") !== null, 10000);
+      const form = document.querySelector("#host .fp-password form");
+      const pane = document.querySelector("#host .fp-root").getBoundingClientRect();
+      const box = form?.getBoundingClientRect();
+      note("promptTitle", text("#host .fp-password-title"));
+      note("cardRect", box === undefined ? "none" : [box.left, box.top, box.width, box.height].map(Math.round).join(","));
+      note("pane", [pane.left, pane.top, pane.width, pane.height].map(Math.round).join(","));
+      note("cardInside", box !== undefined && box.left >= pane.left - 1 && box.right <= pane.right + 1);
+      note("inputAutofocused", document.activeElement?.className ?? "-");
+      // Escape is the way out that is not "open it".
+      document.querySelector("#host .fp-password-input")
+        .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await settle(800);
+      note("cardGoneAfterEscape", document.querySelector("#host .fp-password") === null);
+      note("failureShown", document.querySelector("#host .fp-status[data-failed]") !== null);
+      note("failureText", (text("#host .fp-status") ?? "-").slice(0, 40));
+    }
+
+    if (scenario === "password") {
+      note("promptShown", await until(() => document.querySelector("#host .fp-password") !== null, 8000));
+      note("promptTitle", text("#host .fp-password-title"));
+      note("promptHint", text("#host .fp-password-hint"));
+      note("loadingHidden", document.querySelector("#host .fp-status") === null);
+      const input = document.querySelector("#host .fp-password-input");
+      note("submitDisabledWhileEmpty", document.querySelector("#host .fp-password-submit")?.disabled);
+      type(input, params.get("password") ?? "secret");
+      await settle(250);
+      note("submitEnabledAfterTyping", document.querySelector("#host .fp-password-submit")?.disabled === false);
+      click("打开");
+      note("opened", await until(hasCanvas, 20000));
+      note("canvases", all("#host .fp-pages canvas").length);
+      note("promptGone", document.querySelector("#host .fp-password") === null);
+    }
+
+    // Probes written after this file grew past the readable size live in
+    // `./scenarios/<owner>.mjs`: the map key is the `?scenario=` value, and the
+    // entry gets the same toolbox the blocks above use. One file per owner, so
+    // two probes can be written at the same time without both editing this one.
+    const { loadScenario } = await import("./scenarios/index.mjs");
+    const probe = loadScenario(scenario);
+    note("probeStage", `${scenario}:${probe === null ? "null" : "fn"}`);
+    if (probe !== null) {
+      // The same selection gesture the `defects` block uses, generalised: a
+      // range over the first text node of a text-layer span, then a mouseup on
+      // the frame — which is what the bubble's own listener listens for.
+      const selectSpan = (node, from = 0, to = 12) => {
+        // The characters, wherever pdf.js put them: a text-layer span can hold an
+        // inner element, and it can start with an empty text node — a range made
+        // on either has no characters, so the selection looks empty
+        // (measured: rawSel="" while isCollapsed=false, and the pill then looks
+        // like it never appeared).
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        let textNode = null;
+        while (walker.nextNode() !== null) {
+          if (walker.currentNode.length > 0) {
+            textNode = walker.currentNode;
+            break;
+          }
+        }
+        textNode = textNode ?? node.firstChild;
+        const range = document.createRange();
+        range.setStart(textNode, from);
+        range.setEnd(textNode, Math.min(to, textNode.length));
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        // The pointer's landing point rides along, the way a real mouseup carries
+        // it: it is the pane's fallback anchor when a page redrew under the hand.
+        const box = node.getBoundingClientRect();
+        document.querySelector("#host .fp-frame")
+          .dispatchEvent(new MouseEvent("mouseup", {
+            bubbles: true,
+            clientX: Math.round(box.right - 2),
+            clientY: Math.round(box.top + box.height / 2),
+          }));
+      };
+      await probe({
+        note, until, settle, click, type, all, text, labelOf, buttons, pagesLabel,
+        hasCanvas, openMore, focusEndBox, DICT, t, params, host, root, Body, bytes,
+        handle, readBytes, tabSignal, show, h: window.React.createElement, React: window.React, selectSpan,
+        spans: () => all("#host .fp-pages .textLayer span"),
+        frameTop: () => Math.round(document.querySelector("#host .fp-frame").scrollTop),
+      });
+    }
+  }
+
+  run()
+    .catch((error) => facts.push(`ERROR=${String(error && error.message || error).slice(0, 200)}`))
+    .finally(() => {
+      window.__facts = facts;
+      document.getElementById("facts").textContent = facts.join("\n");
+      document.title = `ready ${facts.length}`;
+    });
+</script>
+</body>
+</html>

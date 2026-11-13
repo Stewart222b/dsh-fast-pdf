@@ -1,0 +1,13 @@
+# Generated test sample — 34 MB, rebuilt on demand:
+#   node tests/browser/make-samples.mjs
+tests/browser/samples/huge.pdf
+
+# Screenshots and profiles left behind by the regression runs
+tests/browser/shot-*.png
+fp-run-*/
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
