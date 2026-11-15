@@ -123,8 +123,8 @@ primitives.Button; primitives.Tooltip; primitives.IconSearchOutlineRegular; prim
 
 选中文字 → 选中处浮出「翻译」→ 译文出现在气泡里。三段都是克制的：
 
-- **语言**：不设选项。选中中文就译成英文，选中其它就译成中文（按 CJK 字数占比判断）。
-- **模型**：不填 Key、不填 base URL。宿主半边走和对话同一条路 —— 先看这段 PDF 所属会话的路由（`agent.session.requestHeader().config`），再看 agent 的，最后落到 `agentDefaultModel`。
+- **语言与词条**：不设选项。选中中文就译成英文，选中其它就译成中文（按 CJK 字数占比判断）。短词或短语会生成紧凑的双语词典条目，包含词头、词性、释义和例句；句子或段落只翻译原文并保留格式。
+- **模型**：不填 Key、不填 base URL。宿主半边走和对话同一条路 —— 先看这段 PDF 所属会话的路由（`agent.session.requestHeader().config`），再看 agent 的，最后落到 `agentDefaultModel`。模型支持时，翻译请求会单独设置 `reasoningEffort: "off"`；其他情况下会通过提示词要求模型直接翻译，不会把会话的思考等级复制到请求。提示词无法保证关闭模型底层思考。
 - **失败**：模型没配好、选中太长、宿主没有 `llm` 服务，都只在气泡里写一句原因，不影响阅读。
 
 **高度量早了会让翻上去的卡片压住字**。翻不翻转要拿卡片自己的高度去算，而卡片是长出来的：译文落进来、引文块展开、页脚补上模型名，从第一帧到定稿量过 95.3 → 122 → 130 → 139 px 四个值。最早那版只在状态变化时量一次，量到的是中间值，于是靠页底的卡片翻上去以后正好盖住选区（实测差 1 px，本来该留 8 px 的空）。现在测量挂在 `ResizeObserver` 上，卡片怎么长，落点就跟着重算；`select` 场景靠 `firstBelow=8` / `bottomAbove=8` 两条钉住。
@@ -137,7 +137,7 @@ primitives.Button; primitives.Tooltip; primitives.IconSearchOutlineRegular; prim
 
 两件阅读时最常做的事，各有一条明确的路：
 
-- **双击放大，再双击还原**：双击页面往上跳两档（复用工具栏那套倍率梯子，67% → 75% → 100%），第二下回到**双击前那一档**——通常是个「适应」模式，而不是降一档。渲染器的 `zoomMode` 就是判据：它既是能原样还回去的值，也是"这一下是放大还是还原"的标记。双击落在链接、「翻译」气泡、工具栏、查找栏、目录上都不算；双击顺带吞掉那一下划词，否则气泡会飘在放大后的页面上。
+- **双击选词**：阅读器不拦截页面的 `dblclick`，也不触发缩放；合成事件测试只确认事件未取消、倍率不变、已有选区未清除，不代表测试了浏览器原生选词。
 - **复制出来是纯文本**：页面文字在 pdf.js 的文本层里是一行一个定位 `<span>`，浏览器默认会把这份 DOM 连同 `text/html` 和"每行一个换行"一起写进剪贴板。面板在 `.fp-frame` 上接住 `copy`，只写 `text/plain` 并 `preventDefault()`，内容是 `toString()` 重新排过的一份：拉丁片段之间补一个空格，CJK 之间不补（两个汉字之间加空格本身就是错字）。
 
 这条的断言分两处。`client-smoke.mjs` 把 `selectionPlainText` 从 bundle 源码里提出来直接调（真字符串、真换行），"换行有没有多余"在那里量；`tests/browser` 的 `copy` 场景量的是另一件事——面板认领了这个事件、只写纯文本一种、页面之外的选区一概不碰。合成分发的 `copy` 写不进真剪贴板（浏览器拿自己序列化的选区填 `text/plain`，`transferIsBrowserFilled=true` 就是这个意思），与其假装量到了，不如把这条边界写在场景里。
@@ -315,7 +315,7 @@ powershell -File tests\browser\run-scenario.ps1 -Name find -Sample outline.pdf -
 |---|---|
 | `mount` | 挂起来就有滚动容器、`.pdfViewer` 宿主、工具栏九个按钮（`outlineButtonAppeared` 说明目录按钮是**有目录才出现**）、`injectWithoutActions=ok`（宿主只传 sessionId 的那条路不抛）、`paneIsMono=false`（等宽容器里 `.fp-root` 仍用界面字体） |
 | `nav` | 翻页连点会不会吞步、缩放与「适应」、两帧内连点 |
-| `dblclick` | 双击页面上跳两档（67% → 100%）、再双击**回到双击前的档位**而不是降一档、双击顺带吞掉划词气泡（`bubbleSuppressed`）、双击工具栏不算数（`toolbarDoubleClickKeptZoom`） |
+| `dblclick` | 页面合成双击未取消，倍率不变，已有选区保留；工具栏合成双击也未取消且倍率不变。此场景不验证浏览器原生选词 |
 | `copy` | 复制页面文字时面板认领这个事件（`copyDefaultPrevented`）、只写纯文本一种（`plainFlavourOnly`）、选区在页面之外就不管（`outsideUntouched`）。**合成事件写不进真剪贴板**：浏览器会用它自己序列化的选区填 `text/plain`（`transferIsBrowserFilled=true`），所以"换行有没有多余"这条是在 `client-smoke.mjs` 里直接对 `selectionPlainText` 测的 |
 | `find` | 命中数、高亮落在几页、跳页、Escape 清干净；`hlTimeline` 是每 250 ms 采一次的稳定值 |
 | `hotkey` | `Ctrl/⌘+F` 抢过来打开自己的查找栏，浏览器查找被取消（`dispatchEvent` 返回 false） |
@@ -602,7 +602,7 @@ ok  the live route translates with this session's model — swzc-tech / DeepSeek
 
 M0 / M1 / M2 的代码都已完成：
 
-- 连续滚动、惰性渲染、缩放（含 Ctrl+滚轮）、适应宽度/整页、双击放大与再双击还原；
+- 连续滚动、惰性渲染、缩放（含 Ctrl+滚轮）、适应宽度/整页；页面双击不触发缩放，为浏览器原生选词保留默认事件；
 - 复制选中文字只带走纯文本（没有富文本，也没有每行一个换行）；
 - 目录：文档带 outline 时工具栏多一个目录键，点条目跳转；**目录是浮在文档上的一层**，不挤窄页面（右侧栏本来就没多宽，挤一下版面就全变了），开合带 140 ms 的淡入；节点能逐个折叠，折开是三排数不动的 160 ms 高度过渡（`grid-template-rows: 1fr → 0fr`，向上游学的动画），也有「展开全部 / 折叠全部」；当前读到的那一章高亮；
 - 页码可以直接输入跳转：框里是当前页，右边是总页数；
@@ -649,7 +649,7 @@ M0 / M1 / M2 的代码都已完成：
 | 挂起来 | `mount`：`plain.pdf` 4 页 → 4 个 canvas、`1 / 4`、工具栏按 `aria-label` 读出 `查找 后退 前进 上一页 下一页 缩小 放大 整页显示 更多`（`更多` 在最右，`文档属性` 收在它里面）、缩放 67%、`frameHeight=683`、`toolbarOneRow=true`、`pagerOneRow=true`；没目录的文档不出现目录按钮（`outlineButtonAppeared=false`）；打开途中那行读过 `loadingSeen=正在打开`（本机 34 MB 的 `huge.pdf` 走插件自己的路由，字节到得太快，只抓到准备阶段；百分比那段由 `client-smoke.mjs` 按 `loadingState` 的入参/出参单独量） |
 | 翻页 | `nav`（12 页）：连点两次「下一页」1 → 3，一次「上一页」回 2，同一帧内的两次点击也合成 1 步 |
 | 缩放 | `nav`：`+` → 75%，点适应按钮回 67% |
-| 双击 | `dblclick`（12 页，67% 起）：双击页面 → 100%，再双击 → 67%（回双击前那一档，不是降一档），第三次再上 100%；那一下的划词气泡被吞掉（`bubbleSuppressed=true`），双击工具栏不动（`toolbarDoubleClickKeptZoom=true`） |
+| 双击 | `dblclick` 断言已更新：页面合成双击不被取消、倍率不变、既有选区保留；工具栏双击不改变倍率。本轮未重跑浏览器场景，也未验证原生选词 |
 | 复制 | `copy`：面板认领事件且只写 `text/plain`（`copyDefaultPrevented` / `plainFlavourOnly`），选区在页面之外时一概不碰（`outsideUntouched=true`） |
 | 查找 | `find`：搜 `Page` → `1 / 47`，命中处画出 15 个 `.hl` 落在 4 页上；`Escape` 后查找栏收起、高亮清到 0（`marksCleared=0`） |
 | 键盘查找 | `hotkey`：点页面后按 `Ctrl+F`，浏览器查找被取消（`dispatchEvent` 返回 `false`）、自己的栏开出且输入框已聚焦、搜 `Page` 仍是 `1 / 47` 与 15 个高亮；再按一次栏不重开、焦点拉回；栏外单按 `f` 不被吞 |
@@ -660,7 +660,7 @@ M0 / M1 / M2 的代码都已完成：
 | 加密 PDF | `password`（`samples/pw-aes.pdf`）：问密码（输入框自动聚焦、空密码时「打开」禁用）→ 输入 → 5 页画出、卡片消失；`password-card` 另测卡片落在面板内（`81,288,300,147`）与 `Escape` 收起 |
 | 划词翻译 | `select`：选中 → 气泡「翻译」→ 卡片里出现译文与 `swzc-tech / DeepSeek-V4.1-Flash-1017`，卡片落在焦点端下面 8 px（`firstBelow=8`）；靠页底那次翻到上面，离焦点端顶边也是 8 px（`bottomAbove=8`，`bottomFlipped=true`）；卡片始终在面板内、页面没有横向溢出。`translate-error` 走失败态：卡片里是那条消息、留着「重试」 |
 | 两个文档 | `two`：见上面那张表 |
-| 这一批新搬的 | `port`（`plain.pdf`）：页码框输入 `3` 回车 → `3 / 4`；查找先开「区分大小写」输 `page` → `没有找到`，关掉 → `1 / 4`，再开「整个词」仍 `1 / 4`；「⋯」里 1 行（`文档属性`），点开菜单就收起（`menuClosedOnPick=true`）、属性卡 14 行（`文件名=文档`、`页数=4`、`209.9 × 297.0 mm · 纵向`）、`Escape` 关得掉；气泡固定后页面双击不再换掉它（`pinned=true`、`draggedBy=42`、`cardSurvivedDblclick=true`）|
+| 这一批新搬的 | `port`（`plain.pdf`）：页码框输入 `3` 回车 → `3 / 4`；查找先开「区分大小写」输 `page` → `没有找到`，关掉 → `1 / 4`，再开「整个词」仍 `1 / 4`；「⋯」里 1 行（`文档属性`），点开菜单就收起（`menuClosedOnPick=true`）、属性卡 14 行（`文件名=文档`、`页数=4`、`209.9 × 297.0 mm · 纵向`）、`Escape` 关得掉；气泡固定后的双击断言已更新为不取消事件、不改变倍率且保留固定卡片；这部分本轮尚未执行浏览器复验|
 | 「⋯」菜单 | `menu`：一行 176×36 落在按钮正下方、右边对齐、都在面板内；`pressed=true`；`Escape` 先收它（`client-smoke` 按源码顺序查）、点一行就收起并打开属性卡（`port` 的 `menuClosedOnPick=true`） |
 | 气泡的落点 | `anchor`（`outline.pdf`，跨 3 个 span 选一段）：正向选，气泡左边 = 焦点端左边（差 `0`）、上边离焦点端底边 `8`；反向选（焦点端翻到上一行），差仍是 `0` / `8`——钉的是焦点端，不是整段的并集框；按一下页面气泡收掉 |
 | 大文档 | `perf`（`big.pdf` 200 页）：200 个页框、首屏画 4 页，数字在「打开一份 PDF 的代价」 |

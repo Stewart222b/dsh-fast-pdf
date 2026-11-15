@@ -32,8 +32,6 @@ window.__ModuleLoader__.load({
     const PLACE_DEBOUNCE_MS = 400;
     /** How many tabs keep a reading place. */
     const PLACE_LIMIT = 24;
-    /** How long a completed loading bar stays on screen, at least. */
-    const PROGRESS_HOLD_MS = 280;
     /** Longest passage the selection bubble will send. */
     const SELECTION_LIMIT = 6000;
     /** How long a translation may stay unanswered before the card offers a retry. */
@@ -295,6 +293,14 @@ window.__ModuleLoader__.load({
     };
 
     /** One in-flight module import shared by every body instance. */
+    // A host plugin refresh can preserve the document and its ES-module cache.
+    // Use one revision for this factory, while retaining per-factory deduplication.
+    let moduleRevision = Date.now().toString(36);
+    function moduleAssetUrl(path, base) {
+      const url = new URL(assetUrl(path, base));
+      url.searchParams.set("plugin-rev", moduleRevision);
+      return url.href;
+    }
     let viewerModule;
 
     /** The ported helper modules, one in-flight import per file. */
@@ -480,10 +486,10 @@ window.__ModuleLoader__.load({
       viewerModule = (async () => {
         try {
           if (typeof page !== "string" || page === "") throw new Error("no page base");
-          return await import(assetUrl("viewer.mjs", page));
+          return await import(moduleAssetUrl("viewer.mjs", page));
         } catch (error) {
           if (typeof transport !== "string" || transport === "") throw error;
-          return await import(assetUrl("viewer.mjs", `${new URL(transport).origin}/`));
+          return await import(moduleAssetUrl("viewer.mjs", `${new URL(transport).origin}/`));
         }
       })();
       viewerModule.catch(() => {
@@ -511,10 +517,10 @@ window.__ModuleLoader__.load({
       const pending = (async () => {
         try {
           if (typeof page !== "string" || page === "") throw new Error("no page base");
-          return await import(assetUrl(name, page));
+          return await import(moduleAssetUrl(name, page));
         } catch (error) {
           if (typeof transport !== "string" || transport === "") throw error;
-          return await import(assetUrl(name, `${new URL(transport).origin}/`));
+          return await import(moduleAssetUrl(name, `${new URL(transport).origin}/`));
         }
       })();
       helperModules.set(name, pending);
@@ -1049,6 +1055,7 @@ window.__ModuleLoader__.load({
        * 「固定之后划词不再弹翻译」 bug.
        */
       const [pick, setPick] = React.useState(null);
+      const pickDragCleanupRef = React.useRef(null);
       const [chip, setChip] = React.useState(null);
       // The size the reader dragged the card to, or `null` for "as big as its
       // content". Kept above the card itself so the next translation opens in
@@ -1114,6 +1121,7 @@ window.__ModuleLoader__.load({
       /** The properties card's rows, readable from a callback. */
       const sheetRef = React.useRef(null);
       sheetRef.current = sheet;
+      const sheetRequestRef = React.useRef(0);
       /** The outline rows `sync()` ranks the reading point against. */
       const outlineRef = React.useRef(null);
       outlineRef.current = outline;
@@ -1254,6 +1262,17 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer);
       }, []);
 
+      const updateZoomPreview = React.useCallback((previewScale) => {
+        const current = viewerRef.current;
+        const scale = typeof previewScale === "number" && Number.isFinite(previewScale)
+          ? previewScale / 100
+          : current?.zoom;
+        if (!Number.isFinite(scale)) return;
+        setView((previous) => Math.abs(scale - previous.scale) < 0.001
+          ? previous
+          : { ...previous, scale });
+      }, []);
+
       const sync = React.useCallback(() => {
         const viewer = viewerRef.current;
         if (viewer === null) return;
@@ -1261,7 +1280,7 @@ window.__ModuleLoader__.load({
           const next = {
             page: viewer.currentPage ?? previous.page,
             total: viewer.pageCount ?? previous.total,
-            scale: viewer.zoom ?? previous.scale,
+            scale: viewer.pinch?.target ?? viewer.zoom ?? previous.scale,
             mode: viewer.zoomMode ?? previous.mode,
             back: viewer.history?.canBack?.() === true,
             forward: viewer.history?.canForward?.() === true,
@@ -1638,22 +1657,59 @@ window.__ModuleLoader__.load({
         setPick(null);
       }, []);
 
+      /** Close the properties sheet and invalidate any metadata request. */
+      const closeSheet = React.useCallback(() => {
+        sheetRequestRef.current += 1;
+        sheetRef.current = null;
+        setSheet(null);
+      }, []);
+
       /** Open (or close) the document-properties card. */
       const toggleSheet = React.useCallback(async () => {
         if (sheetRef.current !== null) {
-          setSheet(null);
+          closeSheet();
           return;
         }
         const current = viewerRef.current;
         if (current === null) return;
-        const [snapshot, module] = await Promise.all([
-          current.getDocumentInfo(),
-          loadHelper("document-properties.mjs"),
-        ]);
-        if (snapshot === null || viewerRef.current !== current) return;
+        const request = ++sheetRequestRef.current;
+        let module;
+        try {
+          module = await loadHelper("document-properties.mjs");
+        } catch (error) {
+          console.error("PDF document properties helper failed", error);
+          return;
+        }
+        if (request !== sheetRequestRef.current || viewerRef.current !== current) return;
         const locale = (typeof navigator !== "undefined" && navigator.language) || "zh-CN";
-        setSheet(module.buildDocumentPropertyRows(snapshot, copy.current, locale));
-      }, []);
+        const firstPage = current.pageLayout(1);
+        const basicSnapshot = {
+          fileName: current.name,
+          fileSize: current.sourceBytes,
+          location: current.sourceLocation,
+          pageCount: current.pageCount,
+          pageWidth: firstPage.width,
+          pageHeight: firstPage.height,
+          info: {},
+        };
+        const basicRows = module.buildDocumentPropertyRows(basicSnapshot, copy.current, locale);
+        sheetRef.current = basicRows;
+        setSheet(basicRows);
+
+        // Metadata can require parsing the document's catalog and take long
+        // enough to make the menu feel inert. Show the useful basic rows first,
+        // then enrich them when pdf.js returns. A failure leaves the basic card
+        // open and must not become an unhandled rejection.
+        try {
+          const snapshot = await current.getDocumentInfo();
+          if (snapshot === null || request !== sheetRequestRef.current || viewerRef.current !== current) return;
+          const rows = module.buildDocumentPropertyRows(snapshot, copy.current, locale);
+          sheetRef.current = rows;
+          setSheet(rows);
+        } catch {
+          // Basic document properties remain available without metadata.
+        }
+      }, [closeSheet]);
 
       /**
        * Drag the translation card by its head.
@@ -1669,6 +1725,11 @@ window.__ModuleLoader__.load({
         const root = rootRef.current;
         const start = pickRef.current;
         if (root === null || start === null) return;
+        pickDragCleanupRef.current?.();
+        event.preventDefault();
+        const pointerId = event.pointerId;
+        const captureElement = event.currentTarget;
+        try { captureElement.setPointerCapture?.(pointerId); } catch { /* fallback to window listeners */ }
         const fromX = event.clientX;
         const fromY = event.clientY;
         // Where the card actually is right now, read off the element: after the
@@ -1689,12 +1750,16 @@ window.__ModuleLoader__.load({
         const maxTop = Math.max(4, height - cardHeight - 4);
         let dragging = false;
         const move = (moveEvent) => {
+          if (moveEvent.pointerId !== pointerId) return;
           const dx = moveEvent.clientX - fromX;
           const dy = moveEvent.clientY - fromY;
           // Under a couple of pixels is a click on the head, not a drag.
           if (!dragging && Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
-          dragging = true;
-          event.preventDefault();
+          if (!dragging) {
+            dragging = true;
+            root.setAttribute("data-dragging", "");
+          }
+          moveEvent.preventDefault();
           setPick((held) => (held === null ? held : {
             ...held,
             moved: {
@@ -1703,15 +1768,28 @@ window.__ModuleLoader__.load({
             },
           }));
         };
-        const end = () => {
+        const end = (endEvent = null) => {
+          if (Number.isFinite(endEvent?.pointerId) && endEvent.pointerId !== pointerId) return;
           window.removeEventListener("pointermove", move);
           window.removeEventListener("pointerup", end);
           window.removeEventListener("pointercancel", end);
+          window.removeEventListener("blur", end);
+          captureElement.removeEventListener?.("lostpointercapture", end);
+          root.removeAttribute("data-dragging");
+          if (pickDragCleanupRef.current === end) pickDragCleanupRef.current = null;
+          try {
+            if (captureElement.hasPointerCapture?.(pointerId)) captureElement.releasePointerCapture?.(pointerId);
+          } catch { /* the pointer may already have been released by the browser */ }
         };
+        pickDragCleanupRef.current = end;
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", end);
         window.addEventListener("pointercancel", end);
+        window.addEventListener("blur", end);
+        captureElement.addEventListener?.("lostpointercapture", end);
       }, []);
+
+      React.useEffect(() => () => pickDragCleanupRef.current?.(), []);
 
       /**
        * How big the card is allowed to get.
@@ -1985,48 +2063,6 @@ window.__ModuleLoader__.load({
           event.clipboardData.setData("text/plain", text);
           event.preventDefault();
         };
-        /**
-         * Double-click: two steps up, and a second double-click back again.
-         *
-         * The reader's words for this are 放大 / 还原, so the restoring click has
-         * to land on the zoom the first one started from — usually a fit mode,
-         * not one step down from the enlarged one. `zoomMode` is the renderer's
-         * own name for the current scale (a fit mode or a percentage), so it is
-         * both the value to restore and the mark that tells the two apart.
-         */
-        const enlarged = { from: "", to: "" };
-        const onDoubleClick = (event) => {
-          const current = viewerRef.current;
-          if (current === null) return;
-          if (event.target instanceof Element
-            && event.target.closest("a, .fp-pick, .fp-password, .fp-toolbar, .fp-findbar, .fp-outline") !== null) return;
-          event.preventDefault();
-          if (enlarged.to !== "" && current.zoomMode === enlarged.to) {
-            current.setZoom(enlarged.from);
-            enlarged.from = "";
-            enlarged.to = "";
-            sync();
-            return;
-          }
-          void loadViewer().then((module) => {
-            const now = viewerRef.current;
-            if (now === null || module?.stepZoomPercent === undefined) return;
-            // Two rungs, not one: from a fit mode in a narrow pane a single step
-            // is a couple of percent and does not read as a deliberate gesture.
-            const once = module.stepZoomPercent(Number(now.zoom) * 100 || 100, 1);
-            enlarged.from = now.zoomMode;
-            enlarged.to = String(module.stepZoomPercent(once, 1));
-            now.setZoom(enlarged.to);
-            sync();
-          }, () => {});
-          // The second click of a double-click selected a word on the way; that
-          // is not what was asked for, and leaving it would float the translate
-          // bubble over the enlarged page. A pinned card was put there on
-          // purpose, so the zoom leaves it alone.
-          window.getSelection()?.removeAllRanges();
-          setChip(null);
-          if (pickRef.current?.pinned !== true) setPick(null);
-        };
         // The pill is anchored to a line, not to the pane: the moment the pages
         // slide under it the anchor is a lie — after 下一页 it stayed put while
         // the frame had scrolled 576 px past the words it pointed at. So a scroll
@@ -2042,14 +2078,12 @@ window.__ModuleLoader__.load({
         frame.addEventListener("keyup", onUp);
         frame.addEventListener("mousedown", onDown);
         frame.addEventListener("copy", onCopy);
-        frame.addEventListener("dblclick", onDoubleClick);
         frame.addEventListener("scroll", onScroll, { passive: true });
         return () => {
           frame.removeEventListener("mouseup", onUp);
           frame.removeEventListener("keyup", onUp);
           frame.removeEventListener("mousedown", onDown);
           frame.removeEventListener("copy", onCopy);
-          frame.removeEventListener("dblclick", onDoubleClick);
           frame.removeEventListener("scroll", onScroll);
           clearTimeout(selectionRetry.current);
         };
@@ -2152,10 +2186,17 @@ window.__ModuleLoader__.load({
         let resizeObserver = null;
         let detachWheel = () => {};
         let detachHistory = () => {};
+        let detachScrollDiagnostics = () => {};
         let pages = null;
         /** The cache row this effect owns, once there is something worth keeping. */
         let entry = null;
         const address = sourceAddress;
+        const attachScrollDiagnostics = async (target, module, listenerExists = false) => {
+          const previousScroll = target.onScroll;
+          if (listenerExists) frame.removeEventListener("scroll", previousScroll);
+          detachScrollDiagnostics = module.attach(target, (data) => beacon("scroll-perf", data), { pauseRendering: false, canvasOnly: false });
+          if (listenerExists) frame.addEventListener("scroll", target.onScroll, { passive: true });
+        };
 
         /**
          * Put this viewer back in the cache for the next switch.
@@ -2240,7 +2281,7 @@ window.__ModuleLoader__.load({
             scheduled = requestAnimationFrame(() => {
               scheduled = 0;
               const current = viewerRef.current;
-              if (current === null || disposed) return;
+              if (current === null || disposed || current.pinch) return;
               if (current.zoomMode !== "page-width" && current.zoomMode !== "page-fit") return;
               current.setZoom(current.zoomMode, { silent: true });
               sync();
@@ -2249,55 +2290,25 @@ window.__ModuleLoader__.load({
           resizeObserver.observe(frame);
         };
 
-        /**
-         * Ctrl/⌘ + wheel is how a browser zooms a document; the core ships the
-         * scale maths (`applyWheelZoomScale`) but no listener of its own.
-         *
-         * One layout per animation frame, however many notches arrived.
-         * `setZoom` is not a style flip: it rewrites the size of every page in
-         * the document (`applyPageLayout`) and then measures them again. A
-         * trackpad sends ten wheel events in one task easily, and each one used
-         * to pay that in full — measured on a 40-page file: 1204 page-style
-         * mutations for ten notches and ~140 ms to settle for *one*; on a
-         * 779-page document that is the lag the reader feels.
-         */
+        /** Route modified wheel gestures through the viewer's compositor preview. */
         const watchWheel = (module) => {
-          let pendingScale = null;
-          let zoomFrame = 0;
           const onWheel = (event) => {
             if (!event.ctrlKey && !event.metaKey) return;
             const current = viewerRef.current;
             if (current === null) return;
             event.preventDefault();
-            pendingScale = module.applyWheelZoomScale(
-              pendingScale ?? current.zoom,
-              event.deltaY,
-              event.deltaMode,
-              frame.clientHeight,
-            );
-            if (zoomFrame !== 0) return;
-            zoomFrame = requestAnimationFrame(() => {
-              zoomFrame = 0;
-              const scale = pendingScale;
-              pendingScale = null;
-              const now = viewerRef.current;
-              if (now === null || scale === null || disposed) return;
-              now.setZoom(Math.round(scale * 100));
-              sync();
-            });
+            current.pinchZoom(event);
           };
           frame.addEventListener("wheel", onWheel, { passive: false });
           detachWheel = () => {
             frame.removeEventListener("wheel", onWheel);
-            if (zoomFrame !== 0) cancelAnimationFrame(zoomFrame);
-            zoomFrame = 0;
-            pendingScale = null;
+            viewerRef.current?.cancelPinch();
           };
         };
 
         // This document is still open: re-attach it instead of rebuilding it.
         const parkedRow = address === "" ? undefined : takeOpenDocument(address);
-        const parked = parkedRow !== undefined && parkedRow.bytes === bytes && parkedRow.pages !== undefined
+        const parked = parkedRow !== undefined && parkedRow.bytes === bytes && parkedRow.pages !== undefined && parkedRow.moduleRevision === moduleRevision
           ? parkedRow
           : undefined;
         if (parkedRow !== undefined && parked === undefined) closeOpenDocument(address);
@@ -2309,6 +2320,19 @@ window.__ModuleLoader__.load({
           entry = parked;
           viewerAddress.current = String(parked.address ?? address);
           viewerRef.current = viewer;
+          viewer.onZoomPreview = updateZoomPreview;
+          viewer.onPinchCommit = sync;
+          void loadViewer().then(async (module) => {
+            if (disposed) return;
+            beacon("runtime-viewer-build", {
+              viewerBuild: module.PDF_VIEWER_BUILD ?? "unknown",
+              ...module.runtimeDiagnostics?.(viewer, "reattach"),
+            });
+            try {
+              const diagnostics = await loadHelper("scroll-diagnostics.mjs");
+              if (!disposed) await attachScrollDiagnostics(viewer, diagnostics, true);
+            } catch { /* diagnostic helper must not affect reading */ }
+          });
           viewer.wrapEl = frame;
           viewer.pagesEl = pages;
           viewer.observe();
@@ -2355,6 +2379,7 @@ window.__ModuleLoader__.load({
                 /* ignore */
               }
             }
+            detachScrollDiagnostics();
           };
         }
 
@@ -2369,6 +2394,9 @@ window.__ModuleLoader__.load({
 
         (async () => {
           const module = await loadViewer();
+          if (disposed) return;
+          let diagnostics = null;
+          try { diagnostics = await loadHelper("scroll-diagnostics.mjs"); } catch { /* optional diagnostics */ }
           if (disposed) return;
           // Outline jumps and search jumps both land in this history; it is what
           // gives the reader a way back out of one.
@@ -2393,8 +2421,8 @@ window.__ModuleLoader__.load({
               clearTimeout(placeTimer.current);
               placeTimer.current = setTimeout(savePlace, PLACE_DEBOUNCE_MS);
             },
-            onZoomPreview: () => {},
-            onPinchCommit: () => {},
+            onZoomPreview: updateZoomPreview,
+            onPinchCommit: sync,
             // The background index reports progress; a live query catches up
             // with it instead of waiting for the last page.
             onIndex: () => {
@@ -2411,9 +2439,15 @@ window.__ModuleLoader__.load({
               }),
           });
           viewerRef.current = viewer;
+          if (diagnostics !== null) {
+            await attachScrollDiagnostics(viewer, diagnostics);
+          }
+          beacon("runtime-viewer-build", {
+            viewerBuild: module.PDF_VIEWER_BUILD ?? "unknown",
+            ...module.runtimeDiagnostics?.(viewer, "before-open"),
+          });
           // Every step the viewer can count goes to the bar: laying out the
           // pages becomes a 0-100 countdown instead of an indeterminate swipe.
-          let preparedAt = 0;
           // Bytes first, then the layout — one bar for both. The bar keeps what
           // it reached when the second phase starts instead of counting from 0
           // again (measured: 100 → 48 on a 200-page file, where the read
@@ -2421,6 +2455,15 @@ window.__ModuleLoader__.load({
           // capped just short of full so the layout still has somewhere to go.
           let handover = -1;
           let barPercent = 0;
+          const markProgressDone = (previous) => {
+            const total = Math.max(0, Number(previous?.total) || 0);
+            const loaded = total > 0 ? total : Math.max(0, Number(previous?.loaded) || 0);
+            return { loaded, total, ratio: 1, percent: 100, phase: "prepare" };
+          };
+          const finishOpenProgress = () => {
+            setProgress(markProgressDone);
+            setStatus("ready");
+          };
           await viewer.open({
             data: copyBytes(bytes),
             size: bytes.byteLength ?? bytes.length ?? 0,
@@ -2428,9 +2471,8 @@ window.__ModuleLoader__.load({
             onProgress: (event) => {
               if (disposed) return;
               if (event?.phase === "done") {
-                setProgress((previous) => (previous === null || previous.total <= 0
-                  ? previous
-                  : { loaded: previous.total, total: previous.total, ratio: 1, percent: 100, phase: "prepare" }));
+                loadingPhase.current = "prepare";
+                setProgress(markProgressDone);
                 return;
               }
               const total = Number(event?.total) || 0;
@@ -2439,7 +2481,6 @@ window.__ModuleLoader__.load({
               // A bare `prepare` is the signal that the bytes are in and the
               // layout is starting, whether or not it carries a count yet.
               if (phase === "prepare") loadingPhase.current = "prepare";
-              if (phase === "prepare" && preparedAt === 0) preparedAt = performance.now();
               // One bar for two phases, and it only ever moves forwards: the
               // layout picks up where the bytes stopped instead of counting
               // from zero again (measured: 100 -> 48 on a 200-page file), and a
@@ -2463,16 +2504,13 @@ window.__ModuleLoader__.load({
               });
             },
           });
+          beacon("runtime-viewer-build", {
+            viewerBuild: module.PDF_VIEWER_BUILD ?? "unknown",
+            ...module.runtimeDiagnostics?.(viewer, "after-open"),
+          });
           if (disposed) return;
-          // A full bar that vanishes in the same frame is not a finished bar:
-          // hold it for a blink when the reader actually watched it fill.
-          if (preparedAt !== 0) {
-            const shown = performance.now() - preparedAt;
-            if (shown < PROGRESS_HOLD_MS) {
-              await new Promise((resolve) => setTimeout(resolve, PROGRESS_HOLD_MS - shown));
-              if (disposed) return;
-            }
-          }
+          // Completion and removal of the loading overlay share this commit;
+          // do not hold an opaque loading surface over the already-open page.
           const place = places.get(`${tabIdRef.current}|${address}`);
           if (place !== undefined) {
             // Reopening this tab: resume at the same page and offset.
@@ -2480,12 +2518,13 @@ window.__ModuleLoader__.load({
           } else {
             viewer.setZoom("page-width", { silent: true });
           }
-          setStatus("ready");
+          finishOpenProgress();
           sync();
           // From here on this viewer is worth keeping: a switch away parks it
           // (see `park`), and a switch back re-attaches it.
           entry = {
             address,
+            moduleRevision,
             bytes,
             version: bytesVersionRef.current,
             viewer,
@@ -2525,8 +2564,9 @@ window.__ModuleLoader__.load({
               /* a closing viewer must not break the unmount */
             }
           }
+          detachScrollDiagnostics();
         };
-      }, [bytes, sourceAddress, attempt, sync, refreshFind, savePlace, runFind]);
+      }, [bytes, sourceAddress, attempt, sync, updateZoomPreview, refreshFind, savePlace, runFind]);
 
       /**
        * A click on the page puts the outline column away.
@@ -2655,7 +2695,7 @@ window.__ModuleLoader__.load({
         // way out of it, exactly as the password card answers the same key.
         if (event.key === "Escape" && sheet !== null) {
           event.preventDefault();
-          setSheet(null);
+          closeSheet();
           return;
         }
         // The pill is the lightest of the three, so it is what Escape puts away
@@ -3491,7 +3531,7 @@ window.__ModuleLoader__.load({
           "div",
           {
             className: "fp-panel-mask",
-            onClick: () => setSheet(null),
+            onClick: closeSheet,
           },
           React.createElement(
             "div",
@@ -3511,7 +3551,7 @@ window.__ModuleLoader__.load({
                 // The × needs no tooltip, and inside this sheet the Host's
                 // tooltip landed at the far right of the pane and widened it.
                 tip: false,
-                onClick: () => setSheet(null),
+                onClick: closeSheet,
                 icon: icon("IconCloseOutlineRegular", "M4 4l8 8M12 4l-8 8"),
               }),
             ),
@@ -3653,7 +3693,7 @@ window.__ModuleLoader__.load({
         status === "loading" && password === null
           ? React.createElement(
             "div",
-            { className: "fp-status" },
+            { className: "fp-status", "data-loading": "" },
             // A 100 MB PDF is 50 window reads; the count is the difference
             // between "hung" and "working". Once the bytes are in, the line
             // changes phase instead of sitting frozen on 100%.
@@ -3731,6 +3771,9 @@ window.__ModuleLoader__.load({
      */
     function apply(ctx) {
       const startedAt = Date.now();
+      moduleRevision = `${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      viewerModule = undefined;
+      helperModules.clear();
       const t = ctx.locale.bind(NS);
       const tabs = retainTabs();
       // Where the bytes come from, for the report: `host-route` means the body
@@ -3778,7 +3821,7 @@ window.__ModuleLoader__.load({
                   retainTab: (tabId, signal) => tabs.retain(tabId, signal, actions?.forget),
                   // The one read a `renderer` body needs: the whole file,
                   // through this plugin's own route, past the Host's cap.
-                  readBytes: (address, signal, onProgress) => readWholeFile(address, signal, onProgress),
+                  readBytes: readWholeFile,
                 }),
               },
               PdfBodyGate,

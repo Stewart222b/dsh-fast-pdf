@@ -1,3 +1,5 @@
+import { classifyTranslationMode } from "./public/selection-text.mjs";
+
 /**
  * Translate a passage on the model the user already configured in DSH.
  *
@@ -20,15 +22,27 @@
 /** Longest passage the bubble will send; a selection is a sentence, not a chapter. */
 export const MAX_INPUT = 6000;
 
-/** What the model is told to do. Kept short — every token here is paid per call. */
-const SYSTEM = [
+/** Passage translation rules; kept short because every prompt token is paid per call. */
+const PASSAGE_SYSTEM = [
   "You are a translation engine inside a PDF reader.",
   "Translate the text the user sends into {target}. Rules:",
-  "1. Output only the translation — no preamble, no explanation, no quoting of the original.",
+  "1. Translate directly without extended deliberation; do not explain, analyze, or output reasoning. Output only the translation — no preamble or quoting of the original.",
   "2. Keep paragraph breaks, list markers, numbers, units and formulas exactly as they are.",
   "3. Keep technical terms, product names and code identifiers in their original form.",
   "4. If the text is already in {target}, return it unchanged.",
 ].join("\n");
+
+const TERM_SYSTEM = [
+  "You are a concise bilingual dictionary inside a PDF reader.",
+  "Explain the selected term in {target} for a compact popup. Translate directly without extended deliberation; do not output reasoning.",
+  "Include the headword (keep the original form when helpful), part of speech, 1–3 concise definitions, and 1–2 short example phrases or sentences.",
+  "Do not use Markdown fences.",
+].join("\n");
+
+function buildTranslationSystem(text, target) {
+  const template = classifyTranslationMode(text) === "term" ? TERM_SYSTEM : PASSAGE_SYSTEM;
+  return template.replaceAll("{target}", target);
+}
 
 /**
  * Read one service without declaring it in `inject`.
@@ -42,6 +56,23 @@ function service(ctx, name) {
   } catch {
     return undefined;
   }
+}
+
+/** Best-effort: use an explicit off mode only when model metadata confirms support. */
+async function reasoningOptions(llm, provider, model) {
+  if (typeof llm?.resolveModelInfo !== "function") return { options: {} };
+  let info;
+  try {
+    info = await llm.resolveModelInfo(provider, model);
+  } catch {
+    return { options: {} };
+  }
+  if (!info || typeof info !== "object" || info.reasoning === undefined) return { options: {} };
+  const efforts = info.reasoning?.efforts;
+  if (Array.isArray(efforts) && efforts.some((effort) => effort?.id === "off")) {
+    return { options: { reasoningEffort: "off" } };
+  }
+  return { options: {} };
 }
 
 /**
@@ -113,6 +144,7 @@ export function pickModel(ctx, sessionId) {
 async function ask(ctx, { provider, model, system, prompt, sessionId, maxTokens }) {
   const llm = service(ctx, "llm");
   if (typeof llm?.stream !== "function") return { ok: false, message: "这个 DSH 没有提供 llm 服务，翻译不可用" };
+  const reasoning = await reasoningOptions(llm, provider, model);
   // Two shapes: the message object the host builds, or the bare one some
   // providers accept. Trying the cheap one first keeps this file free of host
   // package imports.
@@ -132,6 +164,7 @@ async function ask(ctx, { provider, model, system, prompt, sessionId, maxTokens 
         ...(sessionId ? { sessionId: String(sessionId) } : {}),
         maxTokens,
         temperature: 0.1,
+        ...reasoning.options,
       })) {
         if (!chunk) continue;
         if (chunk.type === "text-delta") out += chunk.text;
@@ -168,7 +201,7 @@ export async function translateSelection(ctx, input) {
   const answer = await ask(ctx, {
     provider: model.provider,
     model: model.model,
-    system: SYSTEM.replaceAll("{target}", target),
+    system: buildTranslationSystem(text, target),
     prompt: text,
     sessionId: input?.sessionId,
     // Translated text runs longer than the source; the clamp keeps a long
@@ -218,6 +251,7 @@ export async function* translateSelectionStream(ctx, input) {
     yield { ok: false, message: "这个 DSH 没有提供 llm 服务，翻译不可用" };
     return;
   }
+  const reasoning = await reasoningOptions(llm, model.provider, model.model);
   const target = targetLanguage(text);
   const started = Date.now();
   const attempts = [
@@ -232,11 +266,12 @@ export async function* translateSelectionStream(ctx, input) {
       for await (const chunk of llm.stream({
         provider: model.provider,
         model: model.model,
-        system: SYSTEM.replaceAll("{target}", target),
+        system: buildTranslationSystem(text, target),
         messages: [message],
         ...(input?.sessionId ? { sessionId: String(input.sessionId) } : {}),
         maxTokens: Math.min(4096, Math.max(512, Math.ceil(text.length * 1.6))),
         temperature: 0.1,
+        ...reasoning.options,
       })) {
         if (!chunk) continue;
         if (chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text !== "") {

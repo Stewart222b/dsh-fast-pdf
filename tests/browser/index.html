@@ -650,27 +650,29 @@
     }
 
     if (scenario === "dblclick") {
-      // Double-click enlarges two toolbar steps and a second one restores the
-      // zoom the first one started from — the reader's 放大 / 还原.
-      const frame = document.querySelector("#host .fp-frame");
+      // The browser keeps native double-click behavior for selecting a word;
+      // this synthetic event checks only that the pane does not cancel it,
+      // change zoom, or clear a selection that already exists.
       const page = document.querySelector("#host .fp-pages .page");
       const doubleClick = () => page.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+      await until(() => page.querySelector(".textLayer span") !== null, 15000);
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(page.querySelector(".textLayer span"));
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const selectedBefore = selection.toString();
       note("zoomBefore", text("#host .fp-zoom-count"));
-      doubleClick();
-      await settle(800);
-      note("zoomEnlarged", text("#host .fp-zoom-count"));
-      note("bubbleSuppressed", document.querySelector("#host .fp-pick") === null);
-      doubleClick();
-      await settle(800);
-      note("zoomRestored", text("#host .fp-zoom-count"));
-      doubleClick();
-      await settle(800);
-      note("zoomEnlargedAgain", text("#host .fp-zoom-count"));
-      // A double-click on the toolbar is not a page click: it must not zoom.
-      const before = text("#host .fp-zoom-count");
-      document.querySelector("#host .fp-toolbar").dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
-      await settle(400);
-      note("toolbarDoubleClickKeptZoom", text("#host .fp-zoom-count") === before);
+      const zoomBefore = text("#host .fp-zoom-count");
+      note("pageDoubleClickAllowed", doubleClick());
+      await settle(150);
+      note("pageDoubleClickKeptZoom", text("#host .fp-zoom-count") === zoomBefore);
+      note("pageDoubleClickPreservedSelection", selection.toString() === selectedBefore);
+      const beforeToolbar = text("#host .fp-zoom-count");
+      note("toolbarDoubleClickAllowed", document.querySelector("#host .fp-toolbar")
+        .dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true })));
+      await settle(150);
+      note("toolbarDoubleClickKeptZoom", text("#host .fp-zoom-count") === beforeToolbar);
     }
 
     if (scenario === "copy") {
@@ -764,17 +766,31 @@
       // nothing until the switch is off again.
       click(DICT.find);
       await until(() => document.querySelector("#host .fp-find-input") !== null, 4000);
+      const caseToggle = all("#host .fp-find-toggle").find((button) => button.getAttribute("aria-label") === DICT.matchCase);
+      const wordToggle = all("#host .fp-find-toggle").find((button) => button.getAttribute("aria-label") === DICT.wholeWord);
+      note("findTogglesAreKeyboardButtons", [caseToggle, wordToggle].every((button) =>
+        button?.tagName === "BUTTON" && button.type === "button" && button.tabIndex >= 0));
       click(DICT.matchCase);
+      note("caseTogglePressed", caseToggle?.getAttribute("aria-pressed") === "true");
       await settle(150);
       type(document.querySelector("#host .fp-find-input"), "page");
       await settle(1500);
       note("caseOnCount", text("#host .fp-find-count"));
       click(DICT.matchCase);
+      note("caseToggleReleased", caseToggle?.getAttribute("aria-pressed") === "false");
       await until(() => /\//u.test(text("#host .fp-find-count") ?? ""), 20000);
       note("caseOffCount", text("#host .fp-find-count"));
       click(DICT.wholeWord);
+      note("wholeWordTogglePressed", wordToggle?.getAttribute("aria-pressed") === "true");
       await settle(1000);
       note("wholeWordCount", text("#host .fp-find-count"));
+      type(document.querySelector("#host .fp-find-input"), "");
+      await settle(500);
+      note("caseOptionSurvivesClear", caseToggle?.getAttribute("aria-pressed") === "false");
+      note("wholeWordOptionSurvivesClear", wordToggle?.getAttribute("aria-pressed") === "true");
+      type(document.querySelector("#host .fp-find-input"), "page");
+      await settle(1000);
+      note("wholeWordCountAfterRequery", text("#host .fp-find-count"));
       click(DICT.wholeWord);
       await settle(300);
       document.querySelector("#host .fp-find-input")
@@ -811,8 +827,8 @@
       await settle(300);
       note("panelEscape", document.querySelector("#host .fp-panel") === null);
 
-      // A pinned card keeps its place: the page's double-click no longer
-      // replaces it, and the head is a handle.
+      // A pinned card keeps its place during native page double-clicks; this
+      // synthetic event checks preservation, not browser word selection.
       await until(() => document.querySelector("#host .fp-pages .textLayer span") !== null, 15000);
       const span = document.querySelector("#host .fp-pages .textLayer span");
       const picked = window.getSelection();

@@ -578,7 +578,7 @@ export default {
     note("cardsOnScreenPinned", qa(".fp-pick").length);
   },
 
-  // 钉住的卡在「滚动 / 翻页 / 双击放大」三种重排下还在不在、位置动不动。
+  // 钉住的卡在「滚动 / 翻页 / 原生双击」时还在不在、位置动不动。
   // 盯的是 pin 的持久性：这三件事都会让 React 重渲染，pin 丢了就没人看得见。
   "b-pinstay": async (S) => {
     const { note, until, settle } = S;
@@ -608,21 +608,22 @@ export default {
     note("afterTurnPinned", pinnedNow());
     note("afterTurnStayedPut", Math.round(cardBox()?.top ?? -1) === Math.round(before.top));
 
-    // 3) 双击放大：选区被清、气泡被清，但钉住的卡按注释要留下
+    // 3) 合成双击事件不应被阅读器取消或触发重排。它不能验证浏览器原生选词。
     const pagesEl = q(".fp-pages");
     const pageOne = qa(".fp-pages .page")[0] ?? null;
     const pageWBefore = pageOne === null ? 0 : Math.round(pageOne.getBoundingClientRect().width);
     const box = boxOf(pagesEl);
     const at = { clientX: Math.round(box.left + box.width / 2), clientY: Math.round(box.top + box.height / 2) };
-    pagesEl.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, ...at }));
-    await settle(1600);
+    const zoomBefore = S.text("#host .fp-zoom-count");
+    note("dblclickAllowed", pagesEl.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, ...at })));
+    await settle(300);
     const pageWAfter = pageOne === null ? 0 : Math.round(pageOne.getBoundingClientRect().width);
     note("pageWBefore", pageWBefore);
     note("pageWAfter", pageWAfter);
-    note("zoomed", pageWAfter !== pageWBefore);
-    note("afterZoomCard", rect(cardBox()));
-    note("afterZoomPinned", pinnedNow());
-    note("afterZoomChip", q(".fp-chip") !== null);
+    note("zoomUnchanged", S.text("#host .fp-zoom-count") === zoomBefore && pageWAfter === pageWBefore);
+    note("afterDblclickCard", rect(cardBox()));
+    note("afterDblclickPinned", pinnedNow());
+    note("afterDblclickChip", q(".fp-chip") !== null);
 
     // 4) 取消固定：状态要真的松手，再按页面就该消失
     pinButton()?.click();

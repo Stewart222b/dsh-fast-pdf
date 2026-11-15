@@ -62,6 +62,7 @@ function createServices() {
     get(name) {
       if (name === "llm") {
         return {
+          async resolveModelInfo() { return {}; },
           async *stream(request) {
             seen.push(request);
             yield { type: "block-start", index: 0, blockType: "text" };

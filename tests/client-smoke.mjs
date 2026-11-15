@@ -88,6 +88,7 @@ await check("translation route answers with the session's model", async () => {
 
   const seen = [];
   const llm = {
+    async resolveModelInfo() { return {}; },
     async *stream(request) {
       seen.push(request);
       yield { type: "text-delta", text: "译文" };
@@ -303,6 +304,8 @@ await check("registration takes the default seat and keys the body", async () =>
   assert.equal(typeof injected.retainTab, "function");
   injected.retainTab("tab-1", new AbortController().signal);
   assert.equal(typeof injected.readBytes, "function", "the body reads the file through this");
+  assert.equal(slotOptions.inject("sess-46").readBytes, injected.readBytes,
+    "host rerenders must not restart the file-reading effect by replacing readBytes");
 });
 
 await check("a big PDF is streamed through the host half, past the Host's whole-file cap", async () => {
@@ -818,6 +821,52 @@ await check("the overflow menu closes before the sheet, and opens it", async () 
   assert.doesNotMatch(source.slice(moreAt, moreAt + 1200), /"aria-expanded"/u, "no ARIA the primitive would drop");
 });
 
+await check("document properties show basic rows before metadata and ignore stale replies", async () => {
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  const closeStart = source.indexOf("const closeSheet = React.useCallback(() => {");
+  const toggleStart = source.indexOf("const toggleSheet = React.useCallback(async () => {");
+  const closeEnd = source.indexOf("}, []);", closeStart) + "}, []);".length;
+  const toggleEnd = source.indexOf("}, [closeSheet]);", toggleStart) + "}, [closeSheet]);".length;
+  assert.ok(closeStart >= 0 && toggleStart >= 0 && closeEnd > closeStart && toggleEnd > toggleStart);
+  const scopeNames = ["React", "sheetRequestRef", "sheetRef", "setSheet", "viewerRef", "loadHelper", "navigator", "copy", "console", "closeSheet"];
+  const scopeValues = [
+    { useCallback: (fn) => fn },
+    { current: 0 },
+    { current: null },
+    (value) => { calls.push(value); },
+    { current: null },
+    async () => ({ buildDocumentPropertyRows: (snapshot) => [snapshot] }),
+    { language: "en" },
+    { current: {} },
+    { error() {} },
+    null,
+  ];
+  const closeFactory = new Function(...scopeNames, `return (${source.slice(closeStart, closeEnd).replace(/^const closeSheet = /u, "").replace(/;$/u, "")});`);
+  const toggleFactory = new Function(...scopeNames, `return (${source.slice(toggleStart, toggleEnd).replace(/^const toggleSheet = /u, "").replace(/;$/u, "")});`);
+  let resolveMetadata;
+  const current = {
+    name: "manual.pdf", sourceBytes: 1234, sourceLocation: "", pageCount: 8,
+    pageLayout: () => ({ width: 600, height: 800 }),
+    getDocumentInfo: () => new Promise((resolve) => { resolveMetadata = resolve; }),
+  };
+  const calls = [];
+  scopeValues[3] = (value) => { calls.push(value); };
+  scopeValues[4] = { current };
+  const closeSheet = closeFactory(...scopeValues);
+  scopeValues[9] = closeSheet;
+  const toggleSheet = toggleFactory(...scopeValues);
+  const opening = toggleSheet();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls.length, 1, "basic rows render without waiting for metadata");
+  assert.equal(scopeValues[1].current, 1);
+  closeSheet();
+  resolveMetadata({ ...calls[0][0], info: { Title: "Late metadata" } });
+  await opening;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls.length, 2, "late metadata must not reopen the closed card");
+  assert.equal(calls[1], null, "closing keeps the sheet closed");
+});
+
 await check("both stylesheets are linked, pdf.js's first", async () => {
   // Measured, not assumed: dropping `pdf_viewer.css` costs one search match out
   // of four and moves a selection rect from 51,137 to 72,145 — pdf.js's own
@@ -851,6 +900,56 @@ await check("styles follow the Host palette instead of shipping one", async () =
   assert.deepEqual(bare, [], `token used without a fallback: ${bare.join(", ")}`);
   // The viewer measures pages against the frame, so it must stay the offset parent.
   assert.match(css, /\.fp-frame\s*\{[^}]*position:\s*relative/u);
+  assert.match(css, /\.fp-status\[data-loading\]\s*\{[^}]*--dsw-alias-bg-document-preview/u,
+    "the loading surface must hide early canvas paint without changing other status overlays");
+  assert.match(css, /\.fp-findbar \.fp-find-toggle\[aria-pressed="true"\][\s\S]*?--dsw-alias-button-info-fill/u,
+    "the active search switches need a visible Host-blue state");
+  assert.match(css, /\.fp-find-toggle:focus-visible\s*\{[^}]*outline:/u,
+    "search switches retain a visible keyboard focus ring");
+  assert.match(css, /\.fp-find-toggle:disabled\s*\{[^}]*opacity:/u,
+    "disabled search switches remain distinguishable");
+  const loadingFill = /\.fp-loading-fill\s*\{([^}]*)\}/u.exec(css);
+  assert.ok(loadingFill !== null, "loading bar fill rule exists");
+  assert.match(loadingFill[1], /--dsw-alias-button-info-fill,\s*#3b82f6/u, "loading bar uses the Host blue with a fallback");
+  assert.doesNotMatch(loadingFill[1], /transition:/u, "progress width tracks real progress without animation lag");
+});
+
+await check("search case and whole-word options change real results", async () => {
+  const { searchDocument } = await import(pathToFileURL(join(PUBLIC, "search.mjs")).href);
+  const text = "Page page pageable";
+  const offsets = Array.from({ length: text.length }, (_, index) => index);
+  const page = { pageNumber: 1, text, normToRaw: offsets, normToRawEnd: offsets.map((index) => index + 1), rawLength: text.length };
+  assert.equal(searchDocument([page], "page").length, 3, "default search ignores case and matches prefixes");
+  assert.equal(searchDocument([page], "page", { matchCase: true }).length, 2, "matchCase excludes the uppercase Page hit");
+  assert.equal(searchDocument([page], "page", { wholeWord: true }).length, 2, "wholeWord excludes the longer pageable word");
+  assert.equal(searchDocument([page], "page", { matchCase: true, wholeWord: true }).length, 1,
+    "both options combine in the actual search engine");
+});
+
+await check("loading completion reaches 100 and removes the overlay without a hold", async () => {
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.doesNotMatch(source, /PROGRESS_HOLD_MS/u, "there is no post-open progress hold");
+  const doneMatch = source.match(/const markProgressDone = \(previous\) => \{([\s\S]*?)\n          \};/u);
+  assert.ok(doneMatch, "client.js has a progress completion updater");
+  const markDone = new Function("previous", doneMatch[1]);
+  assert.deepEqual(markDone(null), { loaded: 0, total: 0, ratio: 1, percent: 100, phase: "prepare" },
+    "unknown totals stay unknown while completed progress is 100%");
+  assert.deepEqual(markDone({ loaded: 400, total: 1000, ratio: 0.4, percent: 95, phase: "prepare" }),
+    { loaded: 1000, total: 1000, ratio: 1, percent: 100, phase: "prepare" },
+    "known counts finish at their actual total");
+  const finishMatch = source.match(/const finishOpenProgress = \(\) => \{([\s\S]*?)\n          \};/u);
+  assert.ok(finishMatch, "success has one final progress/status update");
+  let progress = null;
+  let status = "loading";
+  new Function("setProgress", "setStatus", "markProgressDone", finishMatch[1])(
+    (update) => { progress = update(progress); },
+    (next) => { status = next; },
+    markDone,
+  );
+  assert.equal(progress.percent, 100);
+  assert.equal(status, "ready");
+  assert.match(source, /status === "loading" && password === null/u,
+    "the loading overlay is absent as soon as status is ready");
 });
 
 await check("the pane asks for the app's typeface, not the code font", async () => {
@@ -1036,6 +1135,114 @@ await check("the ported helpers answer the questions the pane asks them", async 
   assert.equal(outline.destPdfY([{ num: 1, gen: 0 }, { name: "XYZ" }, 0, 500, 0]), 500);
   assert.equal(outline.destPdfY([{ num: 1, gen: 0 }, { name: "FitH" }, 640]), 640);
   assert.ok(Number.isNaN(outline.destPdfY([{ num: 1, gen: 0 }, { name: "Fit" }])), "a fit with no position has no Y");
+});
+
+await check("floating translation drag suppresses selection only during a matching pointer drag", async () => {
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  const marker = "const beginDrag = React.useCallback((event) => {";
+  const start = source.indexOf(marker);
+  const end = source.indexOf("\n      }, []);", start);
+  assert.ok(start >= 0 && end > start, "beginDrag callback source should be present");
+  const body = source.slice(start + marker.length, end);
+  const callbacks = new Function("rootRef", "pickRef", "pickDragCleanupRef", "setPick", "CARD_WIDTH", "window", "Element", `return (event) => {${body}\n};`);
+
+  const listeners = new Map();
+  const fakeWindow = {
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type); },
+  };
+  let draggingAttributeWrites = 0;
+  const root = {
+    offsetWidth: 500, offsetHeight: 400, attributes: new Set(),
+    getBoundingClientRect: () => ({ left: 0, top: 0 }),
+    setAttribute(name) { if (!this.attributes.has(name)) draggingAttributeWrites += 1; this.attributes.add(name); }, removeAttribute(name) { this.attributes.delete(name); },
+  };
+  const card = { offsetWidth: 220, offsetHeight: 100, getBoundingClientRect: () => ({ left: 20, top: 20 }) };
+  class FakeElement {
+    constructor(button = false) { this.button = button; this.captured = null; this.released = null; this.listeners = new Map(); }
+    closest(selector) { return selector === "button" && this.button ? {} : selector === ".fp-pick" ? card : null; }
+    setPointerCapture(id) { this.captured = id; }
+    hasPointerCapture(id) { return this.captured === id; }
+    releasePointerCapture(id) { this.released = id; this.captured = null; }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    removeEventListener(type, listener) { if (this.listeners.get(type) === listener) this.listeners.delete(type); }
+  }
+  const dragCleanupRef = { current: null };
+  let setPickCalls = 0;
+  const beginDrag = callbacks({ current: root }, { current: {} }, dragCleanupRef, () => { setPickCalls += 1; }, 220, fakeWindow, FakeElement);
+  const makeEvent = (pointerId, target = new FakeElement(), currentTarget = new FakeElement()) => ({
+    button: 0, pointerId, target, currentTarget, clientX: 20, clientY: 20,
+    defaultPrevented: false, preventDefault() { this.defaultPrevented = true; },
+  });
+
+  const down = makeEvent(7);
+  down.currentTarget = new FakeElement();
+  beginDrag(down);
+  assert.equal(down.defaultPrevented, true, "eligible pointerdown must prevent native text selection synchronously");
+  assert.ok(listeners.has("pointermove"));
+  assert.equal(down.currentTarget.captured, 7);
+  let browserSelectedText = !down.defaultPrevented;
+  assert.equal(browserSelectedText, false, "native default selection should not start from the drag handle");
+
+  const unrelatedMove = makeEvent(8);
+  listeners.get("pointermove")(unrelatedMove);
+  assert.equal(unrelatedMove.defaultPrevented, false, "unrelated pointers must not be consumed");
+  assert.equal(setPickCalls, 0);
+  const move = makeEvent(7);
+  move.clientX = 40;
+  listeners.get("pointermove")(move);
+  assert.equal(move.defaultPrevented, true, "the active move event must be prevented");
+  assert.equal(root.attributes.has("data-dragging"), true, "selection suppression should be scoped to active dragging");
+  const secondMove = makeEvent(7);
+  secondMove.clientY = 40;
+  listeners.get("pointermove")(secondMove);
+  assert.equal(draggingAttributeWrites, 1, "drag state should only be written on the threshold crossing");
+
+  listeners.get("pointerup")(makeEvent(8));
+  assert.ok(listeners.has("pointermove"), "unrelated pointerup must not end this drag");
+  listeners.get("pointercancel")(makeEvent(7));
+  assert.equal(root.attributes.has("data-dragging"), false);
+  assert.equal(listeners.size, 0, "cancel must remove temporary global listeners");
+  assert.equal(down.currentTarget.released, 7, "pointer capture must release after cleanup");
+
+  const blurDown = makeEvent(11);
+  blurDown.currentTarget = new FakeElement();
+  beginDrag(blurDown);
+  const blurMove = makeEvent(11);
+  blurMove.clientX = 30;
+  listeners.get("pointermove")(blurMove);
+  assert.equal(root.attributes.has("data-dragging"), true);
+  listeners.get("blur")({ type: "blur" });
+  assert.equal(listeners.size, 0, "window blur must end the drag");
+  assert.equal(root.attributes.has("data-dragging"), false, "FocusEvent without pointerId must clear drag styling");
+
+  const lostCaptureDown = makeEvent(13);
+  lostCaptureDown.currentTarget = new FakeElement();
+  beginDrag(lostCaptureDown);
+  lostCaptureDown.currentTarget.listeners.get("lostpointercapture")({ pointerId: 13 });
+  assert.equal(listeners.size, 0, "lost pointer capture must end the drag");
+
+  const previousDown = makeEvent(14);
+  previousDown.currentTarget = new FakeElement();
+  beginDrag(previousDown);
+  const nextDown = makeEvent(15);
+  nextDown.currentTarget = new FakeElement();
+  beginDrag(nextDown);
+  assert.equal(previousDown.currentTarget.released, 14, "a previous drag must release before capturing the next pointer");
+  assert.equal(nextDown.currentTarget.captured, 15);
+  dragCleanupRef.current();
+
+  const unmountDown = makeEvent(12);
+  unmountDown.currentTarget = new FakeElement();
+  beginDrag(unmountDown);
+  dragCleanupRef.current();
+  assert.equal(listeners.size, 0, "unmount cleanup must remove drag listeners");
+  assert.equal(root.attributes.has("data-dragging"), false);
+
+  const buttonDown = makeEvent(9, new FakeElement(true));
+  beginDrag(buttonDown);
+  assert.equal(buttonDown.defaultPrevented, false, "header buttons must keep their native click behavior");
+  assert.equal(listeners.size, 0, "header buttons must not start a drag");
 });
 
 if (failures.length > 0) {
