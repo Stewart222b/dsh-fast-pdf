@@ -804,12 +804,13 @@ await check("the overflow menu closes before the sheet, and opens it", async () 
   assert.ok(menuFirst < sheetSecond, "the menu is answered before the sheet");
   assert.match(handler.slice(menuFirst, sheetSecond), /setMenu\(false\)[\s\S]*return;/u);
 
-  // One row, and the row is the sheet: the menu retires itself before opening it,
-  // so the sheet never sits under a menu that is still up.
+  // Settings and document properties both live in the overflow menu. Each retires
+  // the menu before opening its own panel.
   const menuAt = source.indexOf('className: "fp-menu"');
   assert.notEqual(menuAt, -1, "the menu element is still there");
   const menu = source.slice(menuAt, menuAt + 900);
-  assert.equal(menu.match(/className: "fp-menu-row"/gu)?.length, 1, "exactly one row in the menu");
+  assert.equal(menu.match(/className: "fp-menu-row"/gu)?.length, 2, "settings and properties rows are in the menu");
+  assert.match(menu, /className: "fp-menu-row",[\s\S]{0,140}onClick: \(\) => void openSettings\(\)/u);
   assert.match(menu, /setMenu\(false\);[\s\S]{0,40}void toggleSheet\(\);/u);
   // The open state rides on `pressed`, not on hand-written ARIA: the Host's
   // Button forwards `aria-pressed` and drops everything else it does not know
@@ -819,6 +820,29 @@ await check("the overflow menu closes before the sheet, and opens it", async () 
   // the toolbar one goes through the Host's Button and must not pretend.
   const moreAt = source.indexOf("fp-more");
   assert.doesNotMatch(source.slice(moreAt, moreAt + 1200), /"aria-expanded"/u, "no ARIA the primitive would drop");
+});
+
+await check("settings persist the three reader preferences and apply them at the right time", async () => {
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.ok(source.includes('updatePreference("translationLanguage"'), "language choice saves its preference");
+  assert.ok(source.includes('updatePreference("defaultZoom"'), "zoom choice saves its preference");
+  assert.ok(source.includes('updatePreference("pageGap"'), "page gap saves its preference");
+  assert.match(source, /if \(key === "pageGap"\)[\s\S]{0,140}setPageGap\?\./u,
+    "changing spacing applies it to the open viewer immediately");
+  const savedPlaceAt = source.indexOf("viewer.applyReadingPosition(place)");
+  const defaultZoomAt = source.indexOf("viewer.setZoom(savedPreferences.defaultZoom");
+  assert.ok(savedPlaceAt >= 0 && defaultZoomAt > savedPlaceAt,
+    "new documents use the preferred zoom while saved reading positions win on reopen");
+  assert.match(source, /targetLanguage: preferencesRef\.current\.translationLanguage/u,
+    "translation requests carry the selected language");
+  assert.ok(source.includes('role: "dialog"') && source.includes('"aria-modal": "true"'),
+    "the settings panel is exposed as a modal dialog");
+  assert.match(source, /event\.key === "Tab"[\s\S]{0,600}focusable\[0\][\s\S]{0,400}last\.focus\(\)/u,
+    "Tab and Shift+Tab stay inside the settings dialog");
+  assert.match(source, /event\.key === "Escape"[\s\S]{0,100}event\.stopPropagation\(\)/u,
+    "the dialog closes itself once on Escape");
+  assert.match(source, /const closeSettings = React\.useCallback\(\(\) => \{[\s\S]{0,180}moreRef\.current\?\.querySelector\("button"\)\?\.focus\(\)/u,
+    "closing settings restores focus to the overflow trigger");
 });
 
 await check("document properties show basic rows before metadata and ignore stale replies", async () => {
@@ -1144,7 +1168,7 @@ await check("floating translation drag suppresses selection only during a matchi
   const end = source.indexOf("\n      }, []);", start);
   assert.ok(start >= 0 && end > start, "beginDrag callback source should be present");
   const body = source.slice(start + marker.length, end);
-  const callbacks = new Function("rootRef", "pickRef", "pickDragCleanupRef", "setPick", "CARD_WIDTH", "window", "Element", `return (event) => {${body}\n};`);
+  const callbacks = new Function("rootRef", "pickRef", "pickDragCleanupRef", "pickDragPositionRef", "setPick", "CARD_WIDTH", "window", "Element", "requestAnimationFrame", "cancelAnimationFrame", `return (event) => {${body}\n};`);
 
   const listeners = new Map();
   const fakeWindow = {
@@ -1153,11 +1177,13 @@ await check("floating translation drag suppresses selection only during a matchi
   };
   let draggingAttributeWrites = 0;
   const root = {
-    offsetWidth: 500, offsetHeight: 400, attributes: new Set(),
+    offsetWidth: 500, offsetHeight: 400, attributes: new Set(), listeners: new Map(),
     getBoundingClientRect: () => ({ left: 0, top: 0 }),
     setAttribute(name) { if (!this.attributes.has(name)) draggingAttributeWrites += 1; this.attributes.add(name); }, removeAttribute(name) { this.attributes.delete(name); },
+    addEventListener(type, listener) { this.listeners.set(type, listener); },
+    removeEventListener(type, listener) { if (this.listeners.get(type) === listener) this.listeners.delete(type); },
   };
-  const card = { offsetWidth: 220, offsetHeight: 100, getBoundingClientRect: () => ({ left: 20, top: 20 }) };
+  const card = { offsetWidth: 220, offsetHeight: 100, style: { left: "20px", top: "20px" }, getBoundingClientRect: () => ({ left: 20, top: 20 }) };
   class FakeElement {
     constructor(button = false) { this.button = button; this.captured = null; this.released = null; this.listeners = new Map(); }
     closest(selector) { return selector === "button" && this.button ? {} : selector === ".fp-pick" ? card : null; }
@@ -1168,8 +1194,15 @@ await check("floating translation drag suppresses selection only during a matchi
     removeEventListener(type, listener) { if (this.listeners.get(type) === listener) this.listeners.delete(type); }
   }
   const dragCleanupRef = { current: null };
+  const dragPositionRef = { current: null };
   let setPickCalls = 0;
-  const beginDrag = callbacks({ current: root }, { current: {} }, dragCleanupRef, () => { setPickCalls += 1; }, 220, fakeWindow, FakeElement);
+  let pickedState = {};
+  const rafs = new Map();
+  let nextRaf = 1;
+  const requestFrame = (callback) => { const id = nextRaf++; rafs.set(id, callback); return id; };
+  const cancelFrame = (id) => rafs.delete(id);
+  const beginDrag = callbacks({ current: root }, { current: {} }, dragCleanupRef, dragPositionRef,
+    (update) => { setPickCalls += 1; pickedState = update(pickedState); }, 220, fakeWindow, FakeElement, requestFrame, cancelFrame);
   const makeEvent = (pointerId, target = new FakeElement(), currentTarget = new FakeElement()) => ({
     button: 0, pointerId, target, currentTarget, clientX: 20, clientY: 20,
     defaultPrevented: false, preventDefault() { this.defaultPrevented = true; },
@@ -1194,15 +1227,33 @@ await check("floating translation drag suppresses selection only during a matchi
   assert.equal(move.defaultPrevented, true, "the active move event must be prevented");
   assert.equal(root.attributes.has("data-dragging"), true, "selection suppression should be scoped to active dragging");
   const secondMove = makeEvent(7);
+  secondMove.clientX = 60;
   secondMove.clientY = 40;
   listeners.get("pointermove")(secondMove);
   assert.equal(draggingAttributeWrites, 1, "drag state should only be written on the threshold crossing");
-
+  assert.equal(setPickCalls, 0, "pointer moves must not trigger React state updates");
+  assert.equal(rafs.size, 1, "multiple moves in one frame should schedule one DOM update");
+  const [frameId, paintFrame] = rafs.entries().next().value;
+  rafs.delete(frameId);
+  paintFrame();
+  assert.equal(card.style.left, "60px");
+  assert.equal(card.style.top, "40px");
+  const selectStart = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  root.listeners.get("selectstart")(selectStart);
+  assert.equal(selectStart.defaultPrevented, true, "drag blocks only new selection starts inside its root");
+  assert.equal(setPickCalls, 0, "the RAF DOM write should not rerender React");
+  const lastMove = makeEvent(7);
+  lastMove.clientX = 80;
+  lastMove.clientY = 90;
+  listeners.get("pointermove")(lastMove);
   listeners.get("pointerup")(makeEvent(8));
   assert.ok(listeners.has("pointermove"), "unrelated pointerup must not end this drag");
-  listeners.get("pointercancel")(makeEvent(7));
+  listeners.get("pointerup")(makeEvent(7));
   assert.equal(root.attributes.has("data-dragging"), false);
   assert.equal(listeners.size, 0, "cancel must remove temporary global listeners");
+  assert.equal(setPickCalls, 1, "drag end should commit moved position once");
+  assert.deepEqual(pickedState.moved, { left: 80, top: 90 }, "pointerup must flush the final coordinates");
+  assert.equal(rafs.size, 0, "pointerup must cancel the pending frame after flushing it synchronously");
   assert.equal(down.currentTarget.released, 7, "pointer capture must release after cleanup");
 
   const blurDown = makeEvent(11);
@@ -1235,14 +1286,20 @@ await check("floating translation drag suppresses selection only during a matchi
   const unmountDown = makeEvent(12);
   unmountDown.currentTarget = new FakeElement();
   beginDrag(unmountDown);
+  const beforeUnmountCommit = setPickCalls;
   dragCleanupRef.current();
   assert.equal(listeners.size, 0, "unmount cleanup must remove drag listeners");
   assert.equal(root.attributes.has("data-dragging"), false);
+  assert.equal(setPickCalls, beforeUnmountCommit, "unmount cleanup must not schedule a React state update");
 
   const buttonDown = makeEvent(9, new FakeElement(true));
   beginDrag(buttonDown);
   assert.equal(buttonDown.defaultPrevented, false, "header buttons must keep their native click behavior");
   assert.equal(listeners.size, 0, "header buttons must not start a drag");
+  const css = readFileSync(join(ROOT, "public", "viewer.css"), "utf8");
+  assert.match(css, /\.fp-pick-head\s*\{[^}]*user-select:\s*none;[^}]*-webkit-user-select:\s*none/s);
+  assert.doesNotMatch(css, /\.fp-root\[data-dragging\]\s*,?\s*\.fp-root\[data-dragging\]\s*\*/,
+    "dragging must not hide the existing native selection highlight across the pane");
 });
 
 if (failures.length > 0) {

@@ -18,7 +18,7 @@ const CMAP_URL = new URL("./cmaps/", import.meta.url).toString();
 const FONT_URL = new URL("./standard_fonts/", import.meta.url).toString();
 const WASM_URL = new URL("./wasm/", import.meta.url).toString();
 const ICC_URL = new URL("./iccs/", import.meta.url).toString();
-export const PDF_VIEWER_BUILD = "2026-11-15-search-navigation-v6";
+export const PDF_VIEWER_BUILD = "2026-11-15-proportional-spacing-v9";
 
 export function runtimeDiagnostics(viewer, phase) {
   const port = viewer?.loadingTask?._worker?.port;
@@ -118,6 +118,7 @@ export class PdfViewer {
     this.scrollSettleTimer = 0;
     this.zoomMode = "page-fit";
     this.zoom = 1;
+    this.pageGap = 14;
     this.baseWidth = 612;
     this.baseHeight = 792;
     this.pageSizes = [];
@@ -277,6 +278,73 @@ export class PdfViewer {
     }
     this.wrapEl.scrollTop = anchor.scrollTop ?? 0;
     this.wrapEl.scrollLeft = anchor.scrollLeft ?? 0;
+  }
+
+  /** Capture the content under the viewport center for zoom-only operations. */
+  captureZoomAnchor() {
+    const centerX = this.wrapEl.clientWidth / 2;
+    const centerY = this.wrapEl.clientHeight / 2;
+    const contentX = this.wrapEl.scrollLeft + centerX;
+    const contentY = this.wrapEl.scrollTop + centerY;
+    if (!this.pageEls.length) return { centerX, centerY, scrollLeft: this.wrapEl.scrollLeft, scrollTop: this.wrapEl.scrollTop, zoom: this.zoom || 1 };
+
+    let index = this.pageIndexAtOffset(contentY);
+    const page = this.pageEls[index];
+    const next = this.pageEls[index + 1];
+    if (next) {
+      const bottom = page.offsetTop + page.offsetHeight;
+      if (contentY > bottom && next.offsetTop - contentY < contentY - bottom) index += 1;
+    }
+    const el = this.pageEls[index];
+    const pageNumber = Number(el.dataset.pageNumber) || index + 1;
+    const layout = this.pageLayout(pageNumber);
+    const zoom = this.zoom || 1;
+    const pageWidth = el.offsetWidth || layout.width * zoom;
+    const pageHeight = el.offsetHeight || layout.height * zoom;
+    const localX = contentX - el.offsetLeft;
+    const localY = contentY - el.offsetTop;
+    const cssX = Math.max(0, Math.min(localX, pageWidth));
+    const cssY = Math.max(0, Math.min(localY, pageHeight));
+    const [pdfX, pdfY] = convertCssToPdfPoint(layout, zoom, cssX, cssY);
+    return {
+      page: pageNumber,
+      zoom,
+      centerX,
+      centerY,
+      pdfX,
+      pdfY,
+      pageX: cssX / zoom,
+      pageY: cssY / zoom,
+      gapX: localX - cssX,
+      gapY: localY - cssY,
+      scrollLeft: this.wrapEl.scrollLeft,
+      scrollTop: this.wrapEl.scrollTop,
+    };
+  }
+
+  /** Restore the zoom anchor after layout changes, scaling page gaps with the page. */
+  restoreZoomAnchor(anchor) {
+    if (!anchor) return;
+    const el = this.pageEls[anchor.page - 1];
+    if (!el) {
+      this.wrapEl.scrollTo({ top: anchor.scrollTop ?? 0, left: anchor.scrollLeft ?? 0, behavior: "auto" });
+      return;
+    }
+    const layout = this.pageLayout(anchor.page);
+    const zoom = this.zoom || 1;
+    const centerX = this.wrapEl.clientWidth / 2;
+    const centerY = this.wrapEl.clientHeight / 2;
+    let cssX;
+    let cssY;
+    if (Number.isFinite(anchor.pdfX) && Number.isFinite(anchor.pdfY) && layout?.viewBox) {
+      [cssX, cssY] = convertPdfToCssPoint(layout, zoom, anchor.pdfX, anchor.pdfY);
+    } else {
+      cssX = anchor.pageX * zoom;
+      cssY = anchor.pageY * zoom;
+    }
+    this.wrapEl.scrollLeft = Math.max(0, el.offsetLeft + cssX + anchor.gapX - centerX);
+    const verticalGapScale = zoom / (anchor.zoom || zoom);
+    this.wrapEl.scrollTop = Math.max(0, el.offsetTop + cssY + anchor.gapY * verticalGapScale - centerY);
   }
 
   async open(source, { onProgress } = {}) {
@@ -477,6 +545,7 @@ export class PdfViewer {
   }
 
   applyPageLayout() {
+    this.applyPageSpacing();
     for (let i = 0; i < this.pageEls.length; i += 1) {
       const el = this.pageEls[i];
       const { width, height } = this.pageLayout(i + 1);
@@ -484,6 +553,13 @@ export class PdfViewer {
       el.style.height = `${height * this.zoom}px`;
       el.style.setProperty("--scale-factor", String(this.zoom));
     }
+  }
+
+  applyPageSpacing() {
+    const zoom = this.zoom || 1;
+    this.pagesEl.style.setProperty?.("--fp-page-gap", `${this.pageGap * zoom}px`);
+    this.pagesEl.style.setProperty?.("--fp-page-pad-top", `${16 * zoom}px`);
+    this.pagesEl.style.setProperty?.("--fp-page-pad-bottom", `${48 * zoom}px`);
   }
 
   /**
@@ -589,7 +665,7 @@ export class PdfViewer {
   setZoom(mode, { silent = false, keepPage = true } = {}) {
     this.cancelZoomAnimations();
     this.cancelPinch();
-    const anchor = keepPage ? this.captureScrollAnchor() : null;
+    const anchor = keepPage ? this.captureZoomAnchor() : null;
     this.zoomMode = String(mode);
     this.zoom = this.computeZoom();
     this.textMappings.clear();
@@ -601,7 +677,7 @@ export class PdfViewer {
       el.querySelector(".hlLayer").replaceChildren();
     }
     this.applyPageLayout();
-    if (anchor) this.restoreScrollAnchor(anchor);
+    if (anchor) this.restoreZoomAnchor(anchor);
     if (!silent) {
       clearTimeout(this.zoomTimer);
       this.zoomTimer = setTimeout(() => this.renderVisible(true), 80);
@@ -609,6 +685,20 @@ export class PdfViewer {
       this.renderVisible(true);
     }
     this.notify();
+  }
+
+  setPageGap(value) {
+    const numeric = Number(value);
+    const gap = Math.round(Math.max(0, Math.min(48, Number.isFinite(numeric) ? numeric : this.pageGap)));
+    this.cancelPinch();
+    if (gap === this.pageGap) return gap;
+    const anchor = this.captureZoomAnchor();
+    this.pageGap = gap;
+    this.applyPageSpacing();
+    this.restoreZoomAnchor(anchor);
+    this.renderVisible();
+    this.notify();
+    return gap;
   }
 
   // Keep the raster and text together on the compositor during zoom gestures.
@@ -619,20 +709,19 @@ export class PdfViewer {
     if (!this.pdf || !this.pageEls.length || (!hasNativeScale && (!Number.isFinite(event.deltaY) || !event.deltaY))) return;
     if (!this.pinch) {
       this.cancelZoomAnimations();
-      const rect = this.wrapEl.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
+      const anchor = this.captureZoomAnchor();
+      const x = anchor.centerX;
+      const y = anchor.centerY;
+      const contentX = this.wrapEl.scrollLeft + x;
       const contentY = this.wrapEl.scrollTop + y;
-      const page = this.pageEls.find(el => el.offsetTop + el.offsetHeight >= contentY)
-        || this.pageEls[this.pageEls.length - 1];
+      const pagesLeft = this.pagesEl.offsetLeft || 0;
+      const pagesTop = this.pagesEl.offsetTop || 0;
       this.pinch = {
-        zoom: this.zoom, target: this.zoom, x, y, page,
-        pageX: (this.wrapEl.scrollLeft + x - page.offsetLeft) / this.zoom,
-        pageY: (contentY - page.offsetTop) / this.zoom,
+        zoom: this.zoom, target: this.zoom, x, y, anchor,
       };
       clearTimeout(this.zoomTimer);
       for (const job of [...this.activeRenderJobs]) this.cancelRenderJob(job);
-      this.pagesEl.style.transformOrigin = `${this.wrapEl.scrollLeft + x}px ${contentY}px`;
+      this.pagesEl.style.transformOrigin = `${contentX - pagesLeft}px ${contentY - pagesTop}px`;
       this.pagesEl.style.willChange = "transform";
     }
     if (hasNativeScale) {
@@ -649,7 +738,8 @@ export class PdfViewer {
       this.pinchFrame = requestAnimationFrame(() => {
         this.pinchFrame = null;
         if (this.pinch) {
-          this.pagesEl.style.transform = `scale(${this.pinch.target / this.pinch.zoom})`;
+          const ratio = this.pinch.target / this.pinch.zoom;
+          this.pagesEl.style.transform = `scale(${ratio})`;
           this.onZoomPreview?.(this.pinch.target * 100);
         }
       });
@@ -675,8 +765,7 @@ export class PdfViewer {
     if (!pinch) return;
     this.cancelPinch();
     this.setZoom(String(pinch.target * 100), { keepPage: false });
-    this.wrapEl.scrollLeft = pinch.page.offsetLeft + pinch.pageX * this.zoom - pinch.x;
-    this.wrapEl.scrollTop = pinch.page.offsetTop + pinch.pageY * this.zoom - pinch.y;
+    this.restoreZoomAnchor(pinch.anchor);
     this.onPinchCommit?.();
   }
 

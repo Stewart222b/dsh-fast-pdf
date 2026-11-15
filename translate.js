@@ -78,9 +78,9 @@ async function reasoningOptions(llm, provider, model) {
 /**
  * Pick the language to translate into.
  *
- * No language picker: a reader who selected Chinese wants English and the other
- * way round, and guessing that from the characters is right far more often than
- * a setting nobody opens.
+ * Infer a target language from the selected text when the preference is set to
+ * automatic. An explicit Chinese or English preference is applied by
+ * `requestedTargetLanguage` before a request is sent.
  * @param text - the selected passage.
  * @returns `Chinese` or `English`.
  */
@@ -89,6 +89,12 @@ export function targetLanguage(text) {
   const letters = (text.match(/[A-Za-z\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/gu) ?? []).length;
   if (letters === 0) return "Chinese";
   return cjk / letters > 0.3 ? "English" : "Chinese";
+}
+
+function requestedTargetLanguage(text, preference) {
+  if (preference === "zh") return "Chinese";
+  if (preference === "en") return "English";
+  return targetLanguage(text);
 }
 
 /**
@@ -196,7 +202,7 @@ export async function translateSelection(ctx, input) {
   if (text.length > MAX_INPUT) return { ok: false, message: `选中内容太长（${text.length} 字），请分段翻译` };
   const model = pickModel(ctx, input?.sessionId);
   if (model === null) return { ok: false, message: "找不到这个会话正在用的模型" };
-  const target = targetLanguage(text);
+  const target = requestedTargetLanguage(text, input?.targetLanguage);
   const started = Date.now();
   const answer = await ask(ctx, {
     provider: model.provider,
@@ -252,7 +258,7 @@ export async function* translateSelectionStream(ctx, input) {
     return;
   }
   const reasoning = await reasoningOptions(llm, model.provider, model.model);
-  const target = targetLanguage(text);
+  const target = requestedTargetLanguage(text, input?.targetLanguage);
   const started = Date.now();
   const attempts = [
     { role: "user", content: [{ type: "text", text }] },

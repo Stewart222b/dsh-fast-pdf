@@ -174,6 +174,15 @@ window.__ModuleLoader__.load({
       unfoldNode: "展开这一节",
       foldNode: "折叠这一节",
       properties: "文档属性",
+      settings: "设置",
+      translationLanguage: "翻译语言",
+      languageAuto: "自动检测",
+      languageChinese: "简体中文",
+      languageEnglish: "English",
+      defaultZoom: "新文档默认缩放",
+      defaultZoomHint: "已有阅读位置会优先恢复。",
+      pageGap: "页面间距（100%）",
+      pageGapHint: "随页面同比缩放，修改后立即应用。",
       more: "更多",
       fileName: "文件名",
       fileSize: "大小",
@@ -257,6 +266,15 @@ window.__ModuleLoader__.load({
       unfoldNode: "Expand this section",
       foldNode: "Collapse this section",
       properties: "Document properties",
+      settings: "Settings",
+      translationLanguage: "Translation language",
+      languageAuto: "Auto detect",
+      languageChinese: "Chinese (Simplified)",
+      languageEnglish: "English",
+      defaultZoom: "Default zoom for new documents",
+      defaultZoomHint: "Saved reading positions take priority.",
+      pageGap: "Page spacing at 100%",
+      pageGapHint: "Scales with document zoom. Changes apply immediately.",
       more: "More",
       fileName: "File name",
       fileSize: "Size",
@@ -1056,6 +1074,7 @@ window.__ModuleLoader__.load({
        */
       const [pick, setPick] = React.useState(null);
       const pickDragCleanupRef = React.useRef(null);
+      const pickDragPositionRef = React.useRef(null);
       const [chip, setChip] = React.useState(null);
       // The size the reader dragged the card to, or `null` for "as big as its
       // content". Kept above the card itself so the next translation opens in
@@ -1064,6 +1083,10 @@ window.__ModuleLoader__.load({
       // The document-properties card's rows, built from the open document the
       // first time it is asked for.
       const [sheet, setSheet] = React.useState(null);
+      const [settingsOpen, setSettingsOpen] = React.useState(false);
+      const [preferences, setPreferences] = React.useState({ translationLanguage: "auto", defaultZoom: "page-fit", pageGap: 14 });
+      const preferencesRef = React.useRef(preferences);
+      preferencesRef.current = preferences;
       // The page box is an input: what the reader is typing, which is not the
       // page they are on until they say so.
       const [pageDraft, setPageDraft] = React.useState("");
@@ -1084,6 +1107,14 @@ window.__ModuleLoader__.load({
       const passwordRef = React.useRef(null);
       const pickRef = React.useRef(pick);
       pickRef.current = pick;
+      React.useLayoutEffect(() => {
+        const position = pickDragPositionRef.current;
+        if (!position || position.active) return;
+        if (pick === null || pick !== position.pick ||
+            (pick.moved?.left === position.left && pick.moved?.top === position.top)) {
+          pickDragPositionRef.current = null;
+        }
+      }, [pick]);
       const chipRef = React.useRef(chip);
       chipRef.current = chip;
       /** Cancels the translation in flight — the card's 停止 button. */
@@ -1579,7 +1610,7 @@ window.__ModuleLoader__.load({
               // keeps other pages in the browser from spending the model quota.
               "x-dsh-fast-pdf": "translate",
             },
-            body: JSON.stringify({ text: current.text, sessionId: sessionRef.current, stream: true }),
+            body: JSON.stringify({ text: current.text, sessionId: sessionRef.current, stream: true, targetLanguage: preferencesRef.current.translationLanguage }),
             signal: controller.signal,
           });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1711,6 +1742,51 @@ window.__ModuleLoader__.load({
         }
       }, [closeSheet]);
 
+      const loadPreferences = React.useCallback(async () => {
+        const module = helperRef.current["preferences.mjs"] ?? await loadHelper("preferences.mjs");
+        helperRef.current["preferences.mjs"] = module;
+        const next = module.readPreferences();
+        preferencesRef.current = next;
+        setPreferences(next);
+        return { module, preferences: next };
+      }, []);
+
+      const closeSettings = React.useCallback(() => {
+        setSettingsOpen(false);
+        requestAnimationFrame(() => moreRef.current?.querySelector("button")?.focus());
+      }, []);
+
+      const openSettings = React.useCallback(async () => {
+        setMenu(false);
+        try {
+          await loadPreferences();
+          setSettingsOpen(true);
+        } catch (error) {
+          console.error("PDF preferences helper failed", error);
+        }
+      }, [loadPreferences]);
+
+      const updatePreference = React.useCallback(async (key, value) => {
+        try {
+          const module = helperRef.current["preferences.mjs"] ?? await loadHelper("preferences.mjs");
+          helperRef.current["preferences.mjs"] = module;
+          const next = module.writePreferences({ ...preferencesRef.current, [key]: value });
+          preferencesRef.current = next;
+          setPreferences(next);
+          if (key === "pageGap") {
+            viewerRef.current?.setPageGap?.(next.pageGap);
+            sync();
+          }
+        } catch (error) {
+          console.error("PDF preferences could not be saved", error);
+        }
+      }, [sync]);
+
+      React.useEffect(() => {
+        if (!settingsOpen) return;
+        rootRef.current?.querySelector(".fp-settings-language")?.focus();
+      }, [settingsOpen]);
+
       /**
        * Drag the translation card by its head.
        *
@@ -1748,7 +1824,20 @@ window.__ModuleLoader__.load({
         const cardHeight = card?.offsetHeight ?? 0;
         const maxLeft = Math.max(4, width - cardWidth - 4);
         const maxTop = Math.max(4, height - cardHeight - 4);
+        const position = { card, pick: start, left: originLeft, top: originTop, active: true, frame: 0 };
+        pickDragPositionRef.current = position;
         let dragging = false;
+        let latestX = fromX;
+        let latestY = fromY;
+        const preventSelection = (selectionEvent) => selectionEvent.preventDefault();
+        const applyPosition = () => {
+          position.left = Math.max(4, Math.min(originLeft + latestX - fromX, maxLeft));
+          position.top = Math.max(4, Math.min(originTop + latestY - fromY, maxTop));
+          position.pendingLeft = undefined;
+          position.pendingTop = undefined;
+          card.style.left = `${position.left}px`;
+          card.style.top = `${position.top}px`;
+        };
         const move = (moveEvent) => {
           if (moveEvent.pointerId !== pointerId) return;
           const dx = moveEvent.clientX - fromX;
@@ -1758,30 +1847,47 @@ window.__ModuleLoader__.load({
           if (!dragging) {
             dragging = true;
             root.setAttribute("data-dragging", "");
+            root.addEventListener("selectstart", preventSelection);
           }
           moveEvent.preventDefault();
-          setPick((held) => (held === null ? held : {
-            ...held,
-            moved: {
-              left: Math.max(4, Math.min(originLeft + dx, maxLeft)),
-              top: Math.max(4, Math.min(originTop + dy, maxTop)),
-            },
-          }));
+          latestX = moveEvent.clientX;
+          latestY = moveEvent.clientY;
+          position.pendingLeft = Math.max(4, Math.min(originLeft + dx, maxLeft));
+          position.pendingTop = Math.max(4, Math.min(originTop + dy, maxTop));
+          if (!position.frame) {
+            position.frame = requestAnimationFrame(() => {
+              position.frame = 0;
+              applyPosition();
+            });
+          }
         };
-        const end = (endEvent = null) => {
+        const end = (endEvent = null, commit = true) => {
           if (Number.isFinite(endEvent?.pointerId) && endEvent.pointerId !== pointerId) return;
+          if (position.frame) cancelAnimationFrame(position.frame);
+          position.frame = 0;
+          if (dragging) {
+            applyPosition();
+            position.active = false;
+            if (commit) setPick((held) => (held === null ? held : { ...held, moved: { left: position.left, top: position.top } }));
+            else if (pickDragPositionRef.current === position) pickDragPositionRef.current = null;
+          } else {
+            position.active = false;
+            if (pickDragPositionRef.current === position) pickDragPositionRef.current = null;
+          }
           window.removeEventListener("pointermove", move);
           window.removeEventListener("pointerup", end);
           window.removeEventListener("pointercancel", end);
           window.removeEventListener("blur", end);
           captureElement.removeEventListener?.("lostpointercapture", end);
+          root.removeEventListener("selectstart", preventSelection);
           root.removeAttribute("data-dragging");
-          if (pickDragCleanupRef.current === end) pickDragCleanupRef.current = null;
+          if (pickDragCleanupRef.current === cleanup) pickDragCleanupRef.current = null;
           try {
             if (captureElement.hasPointerCapture?.(pointerId)) captureElement.releasePointerCapture?.(pointerId);
           } catch { /* the pointer may already have been released by the browser */ }
         };
-        pickDragCleanupRef.current = end;
+        const cleanup = () => end(null, false);
+        pickDragCleanupRef.current = cleanup;
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", end);
         window.addEventListener("pointercancel", end);
@@ -2322,6 +2428,27 @@ window.__ModuleLoader__.load({
           viewerRef.current = viewer;
           viewer.onZoomPreview = updateZoomPreview;
           viewer.onPinchCommit = sync;
+          void loadPreferences().then(({ preferences: saved }) => {
+            if (disposed || viewerRef.current !== viewer) return;
+            viewer.setPageGap?.(saved.pageGap);
+            sync();
+          }, () => {});
+          // A cached viewer outlives the component that originally opened it.
+          // Route notifications to this mount rather than its detached refs.
+          viewer.onState = (state) => {
+            if (frame.isConnected) lastState.current = state;
+            sync();
+          };
+          viewer.onScrollPosition = () => {
+            if (frame.isConnected) lastState.current = viewer.getState();
+            clearTimeout(placeTimer.current);
+            placeTimer.current = setTimeout(savePlace, PLACE_DEBOUNCE_MS);
+          };
+          viewer.onIndex = () => {
+            if (findRef.current.query === "") return;
+            clearTimeout(findTimer.current);
+            findTimer.current = setTimeout(() => void refreshFind(), FIND_DEBOUNCE_MS);
+          };
           void loadViewer().then(async (module) => {
             if (disposed) return;
             beacon("runtime-viewer-build", {
@@ -2395,6 +2522,14 @@ window.__ModuleLoader__.load({
         (async () => {
           const module = await loadViewer();
           if (disposed) return;
+          let savedPreferences = preferencesRef.current;
+          try {
+            const loadedPreferences = await loadPreferences();
+            savedPreferences = loadedPreferences.preferences;
+          } catch {
+            // Settings are optional; the built-in defaults keep opening available.
+          }
+          if (disposed) return;
           let diagnostics = null;
           try { diagnostics = await loadHelper("scroll-diagnostics.mjs"); } catch { /* optional diagnostics */ }
           if (disposed) return;
@@ -2439,6 +2574,7 @@ window.__ModuleLoader__.load({
               }),
           });
           viewerRef.current = viewer;
+          viewer.setPageGap?.(savedPreferences.pageGap);
           if (diagnostics !== null) {
             await attachScrollDiagnostics(viewer, diagnostics);
           }
@@ -2516,7 +2652,7 @@ window.__ModuleLoader__.load({
             // Reopening this tab: resume at the same page and offset.
             viewer.applyReadingPosition(place);
           } else {
-            viewer.setZoom("page-width", { silent: true });
+            viewer.setZoom(savedPreferences.defaultZoom, { silent: true });
           }
           finishOpenProgress();
           sync();
@@ -2689,6 +2825,11 @@ window.__ModuleLoader__.load({
         if (event.key === "Escape" && menu) {
           event.preventDefault();
           setMenu(false);
+          return;
+        }
+        if (event.key === "Escape" && settingsOpen) {
+          event.preventDefault();
+          closeSettings();
           return;
         }
         // The properties card is a read-only sheet over the page; Escape is the
@@ -2954,6 +3095,16 @@ window.__ModuleLoader__.load({
             ? React.createElement(
               "div",
               { className: "fp-menu" },
+              React.createElement(
+                "button",
+                {
+                  type: "button",
+                  className: "fp-menu-row",
+                  onClick: () => void openSettings(),
+                },
+                icon(null, "M8 2.5v2M8 11.5v2M13.5 8h-2M4.5 8h-2M11.9 4.1l-1.4 1.4M5.5 10.5l-1.4 1.4M11.9 11.9l-1.4-1.4M5.5 5.5 4.1 4.1M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z"),
+                React.createElement("span", null, t("settings")),
+              ),
               React.createElement(
                 "button",
                 {
@@ -3254,8 +3405,11 @@ window.__ModuleLoader__.load({
       const pillPlaced = chip === null ? null : placeBubble(chip, PILL_HEIGHT, PILL_WIDTH);
       const bubbleHeight = pick === null ? 0 : pick.cardHeight ?? CARD_TALL;
       const placed = pick === null ? null : placeBubble(pick, bubbleHeight, CARD_WIDTH);
-      const cardLeft = pick === null ? 0 : pick.moved?.left ?? placed?.left ?? 8;
-      const cardTop = pick === null ? 0 : pick.moved?.top ?? placed?.top ?? 8;
+      const dragPosition = pick !== null && pickDragPositionRef.current?.card === cardRef.current?.closest(".fp-pick")
+        ? pickDragPositionRef.current
+        : null;
+      const cardLeft = pick === null ? 0 : dragPosition?.pendingLeft ?? dragPosition?.left ?? pick.moved?.left ?? placed?.left ?? 8;
+      const cardTop = pick === null ? 0 : dragPosition?.pendingTop ?? dragPosition?.top ?? pick.moved?.top ?? placed?.top ?? 8;
 
       // The pill offers the request; the card is the request. Two elements, two
       // lifetimes: a pinned card can be on screen while the next selection's
@@ -3568,6 +3722,114 @@ window.__ModuleLoader__.load({
           ),
         );
 
+      const settingsCard = !settingsOpen
+        ? null
+        : React.createElement(
+          "div",
+          { className: "fp-panel-mask", onClick: closeSettings },
+          React.createElement(
+            "div",
+            {
+              className: "fp-panel fp-settings",
+              role: "dialog",
+              "aria-modal": "true",
+              "aria-label": t("settings"),
+              onClick: (event) => event.stopPropagation(),
+              onKeyDown: (event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  closeSettings();
+                  return;
+                }
+                if (event.key === "Tab") {
+                  const focusable = Array.from(event.currentTarget.querySelectorAll(
+                    'button:not([disabled]), select:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+                  ));
+                  if (focusable.length === 0) {
+                    event.preventDefault();
+                    return;
+                  }
+                  const first = focusable[0];
+                  const last = focusable[focusable.length - 1];
+                  if (event.shiftKey && (document.activeElement === first || !event.currentTarget.contains(document.activeElement))) {
+                    event.preventDefault();
+                    last.focus();
+                  } else if (!event.shiftKey && (document.activeElement === last || !event.currentTarget.contains(document.activeElement))) {
+                    event.preventDefault();
+                    first.focus();
+                  }
+                }
+              },
+            },
+            React.createElement(
+              "div",
+              { className: "fp-panel-head" },
+              React.createElement("span", { className: "fp-settings-heading" }, t("settings")),
+              React.createElement(Button, {
+                label: t("close"),
+                className: "fp-pick-close",
+                tip: false,
+                onClick: closeSettings,
+                icon: icon("IconCloseOutlineRegular", "M4 4l8 8M12 4l-8 8"),
+              }),
+            ),
+            React.createElement(
+              "label",
+              { className: "fp-settings-row" },
+              React.createElement("span", { className: "fp-settings-label" }, t("translationLanguage")),
+              React.createElement(
+                "select",
+                {
+                  className: "fp-settings-select fp-settings-language",
+                  value: preferences.translationLanguage,
+                  onChange: (event) => void updatePreference("translationLanguage", event.target.value),
+                },
+                React.createElement("option", { value: "auto" }, t("languageAuto")),
+                React.createElement("option", { value: "zh" }, t("languageChinese")),
+                React.createElement("option", { value: "en" }, t("languageEnglish")),
+              ),
+            ),
+            React.createElement(
+              "label",
+              { className: "fp-settings-row" },
+              React.createElement("span", { className: "fp-settings-label" }, t("defaultZoom")),
+              React.createElement(
+                "select",
+                {
+                  className: "fp-settings-select",
+                  value: preferences.defaultZoom,
+                  onChange: (event) => void updatePreference("defaultZoom", event.target.value),
+                },
+                ...[["page-fit", t("fitPage")], ["page-width", t("fitWidth")], ["50", "50%"], ["75", "75%"], ["100", "100%"], ["125", "125%"], ["150", "150%"], ["175", "175%"], ["200", "200%"], ["250", "250%"], ["300", "300%"]]
+                  .map(([value, label]) => React.createElement("option", { key: value, value }, label)),
+              ),
+              React.createElement("span", { className: "fp-settings-hint" }, t("defaultZoomHint")),
+            ),
+            React.createElement(
+              "label",
+              { className: "fp-settings-row" },
+              React.createElement(
+                "span",
+                { className: "fp-settings-label fp-settings-gap-label" },
+                t("pageGap"),
+                React.createElement("output", { className: "fp-settings-gap-value", htmlFor: "fp-settings-gap" }, `${preferences.pageGap}px`),
+              ),
+              React.createElement("input", {
+                id: "fp-settings-gap",
+                className: "fp-settings-range",
+                type: "range",
+                min: 0,
+                max: 48,
+                step: 2,
+                value: preferences.pageGap,
+                onChange: (event) => void updatePreference("pageGap", Number(event.target.value)),
+              }),
+              React.createElement("span", { className: "fp-settings-hint" }, t("pageGapHint")),
+            ),
+          ),
+        );
+
       const passwordCard = password === null
         ? null
         : React.createElement(
@@ -3759,6 +4021,7 @@ window.__ModuleLoader__.load({
           )
           : null,
         passwordCard,
+        settingsCard,
         propertiesCard,
         picker,
         pickChip,

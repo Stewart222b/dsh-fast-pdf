@@ -1,0 +1,21 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const source = readFileSync(new URL("../client.js", import.meta.url), "utf8");
+const parked = source.indexOf("if (parked !== undefined) {");
+const start = source.indexOf("viewer.onState =", parked);
+const end = source.indexOf("void loadViewer()", start);
+assert.ok(parked >= 0 && start > parked && end > start);
+let staleUpdates = 0;
+let updates = 0;
+const viewer = { onState: () => { staleUpdates += 1; } };
+const frame = { isConnected: true };
+const lastState = { current: null };
+const sync = () => { updates += 1; };
+const scope = new Function("viewer", "frame", "lastState", "sync", "updateZoomPreview", "placeTimer", "savePlace", "PLACE_DEBOUNCE_MS", "findRef", "findTimer", "refreshFind", "FIND_DEBOUNCE_MS", source.slice(start, end));
+scope(viewer, frame, lastState, sync, () => {}, { current: 0 }, () => {}, 400, { current: { query: "" } }, { current: 0 }, () => {}, 350);
+viewer.onState({ page: 335 });
+assert.equal(staleUpdates, 0, "reattached viewer must not notify a detached component");
+assert.equal(updates, 1, "outline navigation must update the current toolbar after reattach");
+assert.equal(lastState.current.page, 335);
+console.log("reattached viewer routes state to the mounted component");

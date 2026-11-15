@@ -177,6 +177,26 @@ assert.equal(classifyTranslationMode("short 中文短语"), "term");
 
 {
   const requests = [];
+  const llm = { async resolveModelInfo() { return {}; }, stream(request) { requests.push(request); return textResult(); } };
+  const chinese = await translateSelection(context(llm), { text: "This is a complete English sentence.", sessionId: "session-1", targetLanguage: "zh" });
+  const english = await translateSelection(context(llm), { text: "这是一段完整的中文句子。", sessionId: "session-1", targetLanguage: "en" });
+  const automatic = await translateSelection(context(llm), { text: "这是一段完整的中文句子。", sessionId: "session-1", targetLanguage: "auto" });
+  assert.equal(chinese.target, "Chinese");
+  assert.equal(english.target, "English");
+  assert.equal(automatic.target, "English");
+  assert.match(requests[0].system, /into Chinese/);
+  assert.match(requests[1].system, /into English/);
+}
+
+{
+  const requests = [];
+  const llm = { async resolveModelInfo() { return {}; }, async *stream(request) { requests.push(request); yield { type: "text-delta", text: "译文" }; } };
+  for await (const _item of translateSelectionStream(context(llm), { text: "Hello", sessionId: "session-1", targetLanguage: "zh" })) { /* consume */ }
+  assert.match(requests[0].system, /in Chinese/);
+}
+
+{
+  const requests = [];
   const llm = { async resolveModelInfo() { return {}; }, async *stream(request) { requests.push(request); yield { type: "text-delta", text: "translation" }; } };
   for (const text of ["中文短语", "The adapter connects the device to a network."]) {
     for await (const _item of translateSelectionStream(context(llm), { text, sessionId: "session-1" })) { /* consume */ }

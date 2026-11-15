@@ -17,6 +17,7 @@ assert.ok(end > start, "watchWheel function boundary exists");
 const watchWheelSource = source.slice(start, end).replace("        const watchWheel", "const watchWheel");
 
 const frame = {
+  clientWidth: 700,
   clientHeight: 500,
   scrollTop: 0,
   scrollLeft: 0,
@@ -35,11 +36,19 @@ Object.assign(viewer, {
   zoomMode: "100",
   pdf: {},
   pageEls: [
-    { offsetTop: 0, offsetLeft: 0, offsetHeight: 1000, dataset: {} },
-    { offsetTop: 1000, offsetLeft: 0, offsetHeight: 1000, dataset: {} },
+    { offsetTop: 0, offsetLeft: 0, offsetHeight: 1000, dataset: {}, style: {} },
+    { offsetTop: 1000, offsetLeft: 0, offsetHeight: 1000, dataset: {}, style: {} },
   ],
   wrapEl: frame,
   pagesEl: { style: {} },
+  pageGap: 14,
+  pinchPageTransforms: new Map(),
+  pageSizes: [
+    { width: 612, height: 792, viewBox: [0, 0, 612, 792], rotation: 0, userUnit: 1 },
+    { width: 612, height: 792, viewBox: [0, 0, 612, 792], rotation: 0, userUnit: 1 },
+  ],
+  baseWidth: 612,
+  baseHeight: 792,
   cancelZoomAnimations() {},
   activeRenderJobs: new Set(),
   tasks: new Map(),

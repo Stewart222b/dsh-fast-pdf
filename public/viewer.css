@@ -903,8 +903,8 @@ span.fp-outline-caret {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
-  padding: 16px 0 48px;
+  gap: var(--fp-page-gap, 14px);
+  padding: var(--fp-page-pad-top, 16px) 0 var(--fp-page-pad-bottom, 48px);
 }
 
 /* The viewer sizes every page itself; pdf.js's own border would shrink the
@@ -1003,12 +1003,6 @@ span.fp-outline-caret {
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
-}
-
-.fp-root[data-dragging],
-.fp-root[data-dragging] * {
-  user-select: none !important;
-  -webkit-user-select: none !important;
 }
 
 .fp-pick-card {
@@ -1295,6 +1289,70 @@ span.fp-outline-caret {
   text-overflow: ellipsis;
   white-space: nowrap;
   user-select: text;
+}
+
+/* Compact preferences use the same card as document properties, with controls
+   arranged in labeled rows that remain usable in the narrow preview pane. */
+.fp-settings {
+  inline-size: min(380px, 100%);
+  gap: 14px;
+}
+
+.fp-settings-heading {
+  flex: 1;
+  color: var(--dsw-alias-label-primary, light-dark(#0f1115, #f9fafb));
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.fp-settings-row {
+  display: grid;
+  gap: 6px;
+  min-inline-size: 0;
+}
+
+.fp-settings-label {
+  color: var(--dsw-alias-label-secondary, light-dark(#61666b, #cfd3d6));
+}
+
+.fp-settings-select {
+  box-sizing: border-box;
+  inline-size: 100%;
+  min-block-size: 32px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in oklab, currentColor 18%, transparent);
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: var(--dsw-alias-bg-base, light-dark(#ffffff, #151517));
+  color: var(--dsw-alias-label-primary, light-dark(#0f1115, #f9fafb));
+  font: inherit;
+}
+
+.fp-settings-select:focus-visible,
+.fp-settings-range:focus-visible {
+  outline: 2px solid var(--dsw-alias-interactive-bg-primary, #4c8dff);
+  outline-offset: 2px;
+}
+
+.fp-settings-hint {
+  color: var(--dsw-alias-label-tertiary, light-dark(#81858c, #adb2b8));
+  font-size: 11px;
+}
+
+.fp-settings-gap-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.fp-settings-gap-value {
+  color: var(--dsw-alias-label-primary, light-dark(#0f1115, #f9fafb));
+  font-variant-numeric: tabular-nums;
+}
+
+.fp-settings-range {
+  inline-size: 100%;
+  margin: 3px 0;
+  accent-color: var(--dsw-alias-interactive-bg-primary, #4c8dff);
 }
 
 /* Everything above that moves does so to inform: the outline opening, a caret
