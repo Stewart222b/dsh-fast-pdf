@@ -77,9 +77,16 @@ export function buildTextIndex(textContent) {
   return { text, normToRaw, normToRawEnd, rawLength: raw, alternateIndex };
 }
 
+/** Longest query compiled into a RegExp: V8 throws on multi-thousand-char patterns. */
+const MAX_QUERY = 512;
+
 function queryPattern(query, { matchCase = false, wholeWord = false } = {}) {
-  const needle = query.replace(/\u00AD/gu, "").normalize("NFKC").replace(/\s+/gu, " ").trim();
+  let needle = query.replace(/\u00AD/gu, "").normalize("NFKC").replace(/\s+/gu, " ").trim();
   if (!needle) return null;
+  // A pasted paragraph is not a search term. Without this cap `new RegExp`
+  // throws "Invalid regular expression: Stack overflow", and because the caller
+  // is a `void` promise the find bar would stay busy forever.
+  needle = [...needle].slice(0, MAX_QUERY).join("");
   const wordChars = "\\p{L}\\p{M}\\p{N}_";
   const points = [...needle];
   const startsWithWordChar = /[\p{L}\p{M}\p{N}_]/u.test(points[0]);
@@ -87,7 +94,11 @@ function queryPattern(query, { matchCase = false, wholeWord = false } = {}) {
   const leftBoundary = wholeWord && startsWithWordChar ? `(?<![${wordChars}])` : "";
   const rightBoundary = wholeWord && endsWithWordChar ? `(?![${wordChars}])` : "";
   const flags = matchCase ? "gu" : "giu";
-  return new RegExp(`${leftBoundary}${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}${rightBoundary}`, flags);
+  try {
+    return new RegExp(`${leftBoundary}${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}${rightBoundary}`, flags);
+  } catch {
+    return null;
+  }
 }
 
 function rawRange(page, start, end) {

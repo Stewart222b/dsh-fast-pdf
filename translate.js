@@ -22,6 +22,48 @@ import { classifyTranslationMode } from "./public/selection-text.mjs";
 /** Longest passage the bubble will send; a selection is a sentence, not a chapter. */
 export const MAX_INPUT = 6000;
 
+/**
+ * Drain an async iterable but stop waiting the moment `signal` aborts.
+ *
+ * The reader owns the request: closing the card aborts its fetch, and the Host
+ * half has to stop consuming the model stream too. A plain `for await` waits
+ * for the next chunk forever when the model stalls, holding the response and
+ * the upstream call open. Racing each `next()` against the abort signal lets
+ * the loop exit immediately; `iterator.return()` is fired without awaiting it
+ * so a producer stuck inside its own `await` cannot hold this half hostage.
+ * @param iterable - the upstream stream.
+ * @param signal - cancellation signal, or undefined when there is none.
+ * @yields the upstream chunks until the signal aborts.
+ */
+async function* cancellable(iterable, signal) {
+  const iterator = iterable[Symbol.asyncIterator]();
+  let onAbort;
+  const aborted = new Promise((resolve) => {
+    if (signal?.aborted === true) {
+      resolve({ cancelled: true });
+      return;
+    }
+    onAbort = () => resolve({ cancelled: true });
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    for (;;) {
+      const step = await Promise.race([iterator.next(), aborted]);
+      if (step?.cancelled === true || step.done === true) return;
+      yield step.value;
+    }
+  } finally {
+    if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+    // Do not await: a producer blocked in its own await never finishes its
+    // return(), and waiting here would re-create the leak this wrapper fixes.
+    try {
+      void iterator.return?.();
+    } catch {
+      /* the producer is gone; nothing to close */
+    }
+  }
+}
+
 /** Passage translation rules; kept short because every prompt token is paid per call. */
 const PASSAGE_SYSTEM = [
   "You are a translation engine inside a PDF reader.",
@@ -107,8 +149,12 @@ export function pickModel(ctx, sessionId) {
   const agents = service(ctx, "agents");
   let agent;
   try {
+    // Only an agent for *this* session may supply its model. Falling back to
+    // `agents.list()[0]` would borrow another session's provider/model (and
+    // charge its route) whenever the PDF tab's own session has ended. When no
+    // session id is known, the first live agent is still the best guess.
     if (sessionId && typeof agents?.get === "function") agent = agents.get(String(sessionId));
-    if (agent === undefined && typeof agents?.list === "function") agent = (agents.list() ?? [])[0];
+    else if (!sessionId && typeof agents?.list === "function") agent = (agents.list() ?? [])[0];
   } catch {
     agent = undefined;
   }
@@ -147,7 +193,7 @@ export function pickModel(ctx, sessionId) {
  * @param options - provider, model, prompts and limits.
  * @returns `{ok: true, text}` or `{ok: false, message}`.
  */
-async function ask(ctx, { provider, model, system, prompt, sessionId, maxTokens }) {
+async function ask(ctx, { provider, model, system, prompt, sessionId, maxTokens, signal }) {
   const llm = service(ctx, "llm");
   if (typeof llm?.stream !== "function") return { ok: false, message: "这个 DSH 没有提供 llm 服务，翻译不可用" };
   const reasoning = await reasoningOptions(llm, provider, model);
@@ -160,20 +206,24 @@ async function ask(ctx, { provider, model, system, prompt, sessionId, maxTokens 
   ];
   let lastError = "";
   for (const message of attempts) {
+    if (signal?.aborted === true) return { ok: false, message: "翻译已取消" };
     let out = "";
     try {
-      for await (const chunk of llm.stream({
+      for await (const chunk of cancellable(llm.stream({
         provider,
         model,
         system,
         messages: [message],
         ...(sessionId ? { sessionId: String(sessionId) } : {}),
+        ...(signal ? { signal } : {}),
         maxTokens,
         temperature: 0.1,
         ...reasoning.options,
-      })) {
+      }), signal)) {
         if (!chunk) continue;
-        if (chunk.type === "text-delta") out += chunk.text;
+        // A malformed delta must not become the literal "undefined" or
+        // "[object Object]" in the bubble (the streaming path guards this).
+        if (chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text !== "") out += chunk.text;
         if (chunk.type === "finish" && chunk.reason?.kind === "error") {
           const failure = chunk.reason.failure ?? {};
           return { ok: false, message: String(failure.message ?? failure.code ?? "模型返回了错误") };
@@ -194,9 +244,10 @@ async function ask(ctx, { provider, model, system, prompt, sessionId, maxTokens 
  * Translate one selected passage.
  * @param ctx - plugin context.
  * @param input - `{text, sessionId}` from the viewer.
+ * @param options - optional `{signal}` for the reader's cancellation.
  * @returns a JSON-ready result object.
  */
-export async function translateSelection(ctx, input) {
+export async function translateSelection(ctx, input, options = {}) {
   const text = typeof input?.text === "string" ? input.text.trim() : "";
   if (text === "") return { ok: false, message: "没有选中文字" };
   if (text.length > MAX_INPUT) return { ok: false, message: `选中内容太长（${text.length} 字），请分段翻译` };
@@ -210,6 +261,7 @@ export async function translateSelection(ctx, input) {
     system: buildTranslationSystem(text, target),
     prompt: text,
     sessionId: input?.sessionId,
+    signal: options.signal,
     // Translated text runs longer than the source; the clamp keeps a long
     // selection from being cut off mid-sentence.
     maxTokens: Math.min(4096, Math.max(512, Math.ceil(text.length * 1.6))),
@@ -235,9 +287,11 @@ export async function translateSelection(ctx, input) {
  * each piece straight to the reader.
  * @param ctx - plugin context.
  * @param input - `{text, sessionId}` from the viewer.
+ * @param options - optional `{signal}` for the reader's cancellation.
  * @yields `{delta}` while the model talks, then one final result object.
  */
-export async function* translateSelectionStream(ctx, input) {
+export async function* translateSelectionStream(ctx, input, options = {}) {
+  const signal = options.signal;
   const text = typeof input?.text === "string" ? input.text.trim() : "";
   if (text === "") {
     yield { ok: false, message: "没有选中文字" };
@@ -266,22 +320,26 @@ export async function* translateSelectionStream(ctx, input) {
   ];
   let lastError = "";
   for (const message of attempts) {
+    if (signal?.aborted === true) return;
     let out = "";
     let spoke = false;
     try {
-      for await (const chunk of llm.stream({
+      for await (const chunk of cancellable(llm.stream({
         provider: model.provider,
         model: model.model,
         system: buildTranslationSystem(text, target),
         messages: [message],
         ...(input?.sessionId ? { sessionId: String(input.sessionId) } : {}),
+        ...(signal ? { signal } : {}),
         maxTokens: Math.min(4096, Math.max(512, Math.ceil(text.length * 1.6))),
         temperature: 0.1,
         ...reasoning.options,
-      })) {
+      }), signal)) {
         if (!chunk) continue;
         if (chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text !== "") {
           out += chunk.text;
+          // Anything the reader has already seen counts as "spoke", even if a
+          // later attempt would otherwise repeat it.
           spoke = true;
           yield { delta: chunk.text };
         }

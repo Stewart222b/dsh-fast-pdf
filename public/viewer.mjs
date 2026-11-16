@@ -247,7 +247,18 @@ export class PdfViewer {
     const cssY = probe - el.offsetTop;
     const layout = this.pageLayout(point.page);
     const zoom = this.zoom || 1;
-    const [pdfX, pdfY] = convertCssToPdfPoint(layout, zoom, cssX, cssY);
+    let [pdfX, pdfY] = convertCssToPdfPoint(layout, zoom, cssX, cssY);
+    if (!Number.isFinite(pdfX) || !Number.isFinite(pdfY)) {
+      // `prefetchPageSizes` fills the later pages in the background, so a jump
+      // right after `open()` can find no `viewBox`. A NaN anchor silently makes
+      // `history.same()` fall back to comparing raw offsets (losing the text
+      // position), and JSON turns it into null. Use the same page-space
+      // fallback `getReadingPoint()` does; `restoreScrollAnchor` only consumes
+      // pdfX/pdfY when a viewBox exists, so the offset pair stays authoritative.
+      const { height } = layout;
+      pdfX = cssX / zoom;
+      pdfY = height > 0 && zoom > 0 ? height - cssY / zoom : NaN;
+    }
     return {
       page: point.page,
       pdfX,
@@ -342,9 +353,12 @@ export class PdfViewer {
       cssX = anchor.pageX * zoom;
       cssY = anchor.pageY * zoom;
     }
-    this.wrapEl.scrollLeft = Math.max(0, el.offsetLeft + cssX + anchor.gapX - centerX);
-    const verticalGapScale = zoom / (anchor.zoom || zoom);
-    this.wrapEl.scrollTop = Math.max(0, el.offsetTop + cssY + anchor.gapY * verticalGapScale - centerY);
+    // Both gaps are CSS pixels outside the page box, so both scale with the
+    // page when zoom changes. Scaling only the vertical one left the centre
+    // anchor off for mixed-width pages (a narrow page centred in a wide pane).
+    const gapScale = zoom / (anchor.zoom || zoom);
+    this.wrapEl.scrollLeft = Math.max(0, el.offsetLeft + cssX + anchor.gapX * gapScale - centerX);
+    this.wrapEl.scrollTop = Math.max(0, el.offsetTop + cssY + anchor.gapY * gapScale - centerY);
   }
 
   async open(source, { onProgress } = {}) {
@@ -418,6 +432,11 @@ export class PdfViewer {
     this.hitGeneration += 1;
     this.navigationGeneration += 1;
     clearTimeout(this.zoomTimer);
+    clearTimeout(this.pendingTimer);
+    this.pendingTimer = null;
+    // A smooth jump names its destination for a second; an unmatched
+    // `pendingPage` would swallow the next document's first scroll readout.
+    this.pendingPage = null;
     if (this.scrollFrame) cancelAnimationFrame(this.scrollFrame);
     this.scrollFrame = 0;
     clearTimeout(this.scrollSettleTimer);
@@ -430,15 +449,17 @@ export class PdfViewer {
       job.resolve();
     }
     this.renderQueue.length = 0;
+    // Active jobs need the same settle guarantee as queued ones: their
+    // `renderPageNow()` promise may never land if pdf.js's destroy races it,
+    // and the async `.finally()` alone would leave these slots occupied — the
+    // next document's renders would then queue behind a dead viewer.
     for (const job of this.activeRenderJobs) {
       job.cancelled = true;
       this.tasks.get(job.pageNumber)?.cancel();
       this.textLayers.get(job.pageNumber)?.cancel();
-      if (!this.tasks.has(job.pageNumber)) {
-        this.activeRenderJobs.delete(job);
-        if (this.pageRenderLocks.get(job.pageNumber) === job) this.pageRenderLocks.delete(job.pageNumber);
-      }
+      job.resolve();
     }
+    this.activeRenderJobs.clear();
     this.pageRenderLocks.clear();
     for (const layer of this.textLayers.values()) layer.cancel();
     this.tasks.clear();
@@ -690,6 +711,9 @@ export class PdfViewer {
   setPageGap(value) {
     const numeric = Number(value);
     const gap = Math.round(Math.max(0, Math.min(48, Number.isFinite(numeric) ? numeric : this.pageGap)));
+    // A live zoom animation transforms the old page rectangles; changing the
+    // gap underneath it would leave those transforms misaligned for a frame.
+    this.cancelZoomAnimations();
     this.cancelPinch();
     if (gap === this.pageGap) return gap;
     const anchor = this.captureZoomAnchor();

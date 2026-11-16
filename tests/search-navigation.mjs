@@ -154,3 +154,12 @@ assert.equal(crossPage.scrollsAfterRender, 2, "cold navigation should refine to 
 assert.equal(crossPage.preciseTop, pages[1].offsetTop + 100 - 64, "cold navigation should finish at the precise hit position");
 assert.equal(staleResult.feedbackBeforeNewNavigation, 1, "cold navigation should provide immediate feedback");
 assert.equal(staleResult.feedbackAfterStaleResolve, staleResult.feedbackAfterNewNavigation, "stale render resolution must not scroll back to an old hit");
+
+// A pasted paragraph is not a search term: compiling it used to throw
+// "Invalid regular expression: Stack overflow" and leave the find bar busy.
+const { searchDocument } = await import("../public/search.mjs");
+const onePage = [{ pageNumber: 1, text: "term word", normToRaw: [], normToRawEnd: [], rawLength: 9 }];
+for (const length of [1000, 2000, 20_000]) {
+  assert.doesNotThrow(() => searchDocument(onePage, "a".repeat(length)), `a ${length}-char query must not throw`);
+}
+assert.equal(searchDocument(onePage, "term").length, 1, "ordinary queries still find hits");

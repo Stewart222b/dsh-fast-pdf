@@ -18,7 +18,7 @@
  */
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { open, readFile, rm } from "node:fs/promises";
+import { open, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -431,14 +431,21 @@ if (plan !== -1) {
       const wanted = await readFile(join(ROOT, "tests", "browser", "samples", "plain.pdf"));
       assert.equal(Buffer.compare(Buffer.from(served), wanted), 0, "the joined path is the file that was asked for");
 
-      const absolute = `dsh-resource://file/absolute/${encodeURIComponent("C:")}${encodeURIComponent("/").repeat(0)}`;
-      assert.equal(absolute.startsWith("dsh-resource://file/absolute/"), true);
+      // The Host's `absolute/<path>` grammar drops the leading `/` for POSIX
+      // paths (`absolute/home/ys/a.pdf`), keeps `C:/...` for a Windows drive
+      // and keeps one empty segment for a UNC path. Sending `absolute//Users/...`
+      // would be a UNC address, not the file we want, so strip the leading slash.
+      const absolutePath = join(ROOT, "tests", "browser", "samples", "plain.pdf").replaceAll("\\", "/");
+      const absoluteAddress = `dsh-resource://file/absolute/${absolutePath.replace(/^\/+/u, "").replaceAll(":", "%3A")}`;
+      assert.equal(absoluteAddress.startsWith("dsh-resource://file/absolute/"), true);
       const drive = await fetch(`${url}/fast-pdf/file`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-dsh-fast-pdf": "file" },
-        body: JSON.stringify({ address: `dsh-resource://file/absolute/${join(ROOT, "tests", "browser", "samples", "plain.pdf").replaceAll(":", "%3A").replaceAll("\\", "/")}` }),
+        body: JSON.stringify({ address: absoluteAddress }),
       });
       assert.equal(drive.status, 200, "an absolute address is served as it stands");
+      const absoluteBytes = new Uint8Array(await drive.arrayBuffer());
+      assert.equal(Buffer.compare(Buffer.from(absoluteBytes), wanted), 0, "the absolute address reads the same bytes");
     });
 
     await check("the file route refuses everything else", async () => {
@@ -569,6 +576,66 @@ if (plan !== -1) {
       });
       assert.equal(answer.status, 200);
       assert.equal(JSON.parse(answer.text).ok, false);
+    });
+
+    await check("If-None-Match accepts weak tags, lists and the star", async () => {
+      const live = await fetch(`${url}/fast-pdf/viewer.mjs`);
+      const tag = live.headers.get("etag");
+      assert.ok(tag, "the asset carries a strong ETag");
+      await live.arrayBuffer();
+      for (const candidate of [tag, `W/${tag}`, "*", `"other", ${tag}`, `${tag}, "other"`]) {
+        const answer = await fetch(`${url}/fast-pdf/viewer.mjs`, { headers: { "if-none-match": candidate } });
+        assert.equal(answer.status, 304, `If-None-Match: ${candidate} must revalidate`);
+        await answer.arrayBuffer();
+      }
+    });
+
+    await check("a malformed URL escape is a 404, not a rejected handler", async () => {
+      for (const path of ["/fast-pdf/%zz", "/fast-pdf/%E0%A4%A"]) {
+        const answer = await fetch(`${url}${path}`);
+        assert.equal(answer.status, 404, `${path} must not throw URIError`);
+        await answer.arrayBuffer();
+      }
+    });
+
+    await check("an oversized upload leaves the keep-alive connection usable", async () => {
+      const headers = { "x-dsh-fast-pdf": "translate", "content-type": "application/json" };
+      const oversized = await fetch(`${url}/fast-pdf/translate`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text: "x".repeat(200_000) }),
+      });
+      assert.equal(oversized.status, 200);
+      await oversized.arrayBuffer();
+      // The same connection pool must still serve the next request: an
+      // unread body would be parsed as that request's start line.
+      const next = await fetch(`${url}/fast-pdf/translate`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text: "hi" }),
+      });
+      assert.equal(next.status, 200);
+      await next.arrayBuffer();
+    });
+
+    await check("a same-size, same-mtime edit is served fresh", async () => {
+      // `identityOf` used to cache by (mtimeMs, size) only, so rewriting one
+      // byte at the same size with the mtime restored served the old viewer.
+      const path = join(ROOT, "public", "i18n.mjs");
+      const original = await readFile(path);
+      const info = await stat(path);
+      const rewritten = Buffer.from(original);
+      rewritten[0] = original[0] === 65 ? 66 : 65;
+      try {
+        await writeFile(path, rewritten);
+        await utimes(path, info.atime, info.mtime);
+        const first = await fetch(`${url}/fast-pdf/i18n.mjs`);
+        const bytes = new Uint8Array(await first.arrayBuffer());
+        assert.equal(bytes[0], rewritten[0], "the served bytes must be the current disk bytes");
+      } finally {
+        await writeFile(path, original);
+        await utimes(path, info.atime, info.mtime);
+      }
     });
   } finally {
     // Keep-alive sockets outlive the last response; closing without them hangs.

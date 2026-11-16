@@ -1087,6 +1087,8 @@ window.__ModuleLoader__.load({
       const [preferences, setPreferences] = React.useState({ translationLanguage: "auto", defaultZoom: "page-fit", pageGap: 14 });
       const preferencesRef = React.useRef(preferences);
       preferencesRef.current = preferences;
+      /** Whether the stored preferences have been adopted into React state once. */
+      const preferencesLoadedRef = React.useRef(false);
       // The page box is an input: what the reader is typing, which is not the
       // page they are on until they say so.
       const [pageDraft, setPageDraft] = React.useState("");
@@ -1746,9 +1748,17 @@ window.__ModuleLoader__.load({
         const module = helperRef.current["preferences.mjs"] ?? await loadHelper("preferences.mjs");
         helperRef.current["preferences.mjs"] = module;
         const next = module.readPreferences();
-        preferencesRef.current = next;
-        setPreferences(next);
-        return { module, preferences: next };
+        // Only the first read may adopt the stored value. Every later read
+        // (opening settings again, re-attaching a cached document) must not
+        // overwrite a choice the reader made in this component: the write may
+        // still be in flight, and a stale read would roll the UI — and the
+        // next translation's targetLanguage — back to the stored snapshot.
+        if (!preferencesLoadedRef.current) {
+          preferencesLoadedRef.current = true;
+          preferencesRef.current = next;
+          setPreferences(next);
+        }
+        return { module, preferences: preferencesRef.current };
       }, []);
 
       const closeSettings = React.useCallback(() => {
@@ -1771,6 +1781,9 @@ window.__ModuleLoader__.load({
           const module = helperRef.current["preferences.mjs"] ?? await loadHelper("preferences.mjs");
           helperRef.current["preferences.mjs"] = module;
           const next = module.writePreferences({ ...preferencesRef.current, [key]: value });
+          // A write is at least as fresh as any pending read, so no later
+          // `loadPreferences()` may adopt the stored snapshot over it.
+          preferencesLoadedRef.current = true;
           preferencesRef.current = next;
           setPreferences(next);
           if (key === "pageGap") {
@@ -2495,11 +2508,16 @@ window.__ModuleLoader__.load({
           if (findRef.current.query !== "") void runFind(findRef.current.query, 0, false);
           return () => {
             disposed = true;
+            clearTimeout(findTimer.current);
             clearTimeout(placeTimer.current);
             savePlace();
             resizeObserver?.disconnect();
             detachWheel();
+            detachHistory();
             if (!park()) {
+              viewerRef.current = null;
+              pagesRef.current = null;
+              pages?.remove?.();
               try {
                 viewer?.close();
               } catch {
@@ -2536,8 +2554,12 @@ window.__ModuleLoader__.load({
           // Outline jumps and search jumps both land in this history; it is what
           // gives the reader a way back out of one.
           const history = new module.ViewHistory();
-          if (typeof history.subscribe === "function") {
-            detachHistory = history.subscribe(() => sync());
+          // `ViewHistory` exposes `onChange(fn)`, not `subscribe`. A destination
+          // with a zoom change pushes to the history *after* `notify()` has
+          // already run, so without this listener the back/forward buttons keep
+          // their old disabled state until some later scroll or page turn.
+          if (typeof history.onChange === "function") {
+            detachHistory = history.onChange(() => sync());
           }
           viewer = new module.PdfViewer({
             pagesEl: pages,
@@ -2693,7 +2715,14 @@ window.__ModuleLoader__.load({
           // how to keep a viewer that finished opening, so a failure still
           // closes as it always did.
           if (!park()) {
+            // `park()` only cleans up a viewer that finished opening. A half
+            // opened one still owns a `.fp-pages` container in the frame and a
+            // `pagesRef` pointing at it; leaving both behind makes the next
+            // mount append a second container and judge selections against the
+            // detached one.
             viewerRef.current = null;
+            pagesRef.current = null;
+            pages?.remove?.();
             try {
               viewer?.close();
             } catch {
@@ -2996,8 +3025,12 @@ window.__ModuleLoader__.load({
               // disappear.
               if (event.key === "ArrowUp" || event.key === "ArrowDown") {
                 event.preventDefault();
+                const trimmed = String(pageDraft).trim();
                 const typed = Number(pageDraft);
-                const from = Number.isFinite(typed) && typed > 0 ? typed : view.page;
+                // "0" is a typed value: stepping up from it must land on page
+                // 1, not fall back to the current page and skip ahead. An empty
+                // (or non-numeric) box still means "step from where I am".
+                const from = trimmed !== "" && Number.isFinite(typed) ? Math.max(0, typed) : view.page;
                 // Clamped here as well as in `commitPage`, so the number left
                 // in the box is the page that was actually reached.
                 const target = Math.min(Math.max(1, from + (event.key === "ArrowUp" ? 1 : -1)), Math.max(1, view.total || 1));

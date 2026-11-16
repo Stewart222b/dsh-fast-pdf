@@ -364,3 +364,36 @@ function fakeElement() {
   await target;
   viewer.close();
 }
+
+// `close()` must not leave a smooth-jump marker or active render slots behind:
+// the next document (which reuses this viewer object) would otherwise read the
+// wrong page and queue all of its renders behind dead jobs.
+{
+  const viewer = createViewer();
+  viewer.pendingPage = 5;
+  viewer.pendingTimer = setTimeout(() => {}, 10_000);
+  viewer.renderPageNow = () => new Promise(() => {});
+  viewer.wrapEl.scrollTop = 0;
+  viewer.pageEls = [{ offsetTop: 0, offsetHeight: 200, dataset: { pageNumber: "1" } }];
+  viewer.renderPage(1);
+  assert.equal(viewer.activeRenderJobs.size, 1, "one render is active before close");
+  viewer.close();
+  assert.equal(viewer.pendingPage, null, "close clears the pending smooth-jump page");
+  assert.equal(viewer.pendingTimer, null, "close clears the pending timer");
+  assert.equal(viewer.activeRenderJobs.size, 0, "close releases active render slots");
+  assert.equal(viewer.pageRenderLocks.size, 0, "close releases page render locks");
+}
+
+// An anchor captured before later page sizes are known must stay finite: a
+// NaN anchor makes history.same() fall back to raw offsets and loses the text
+// position, and JSON serialises it as null.
+{
+  const viewer = createViewer();
+  // createViewer() stubs captureScrollAnchor to null; use the real one here.
+  delete viewer.captureScrollAnchor;
+  viewer.pageEls = [{ offsetTop: 0, offsetHeight: 200, offsetLeft: 0, dataset: { pageNumber: "1" }, querySelector: () => null }];
+  viewer.pageSizes = []; // prefetch has not filled this page yet
+  viewer.wrapEl.scrollTop = 400;
+  const anchor = viewer.captureScrollAnchor();
+  assert.ok(Number.isFinite(anchor.pdfY), "an unsized page still yields a finite anchor");
+}

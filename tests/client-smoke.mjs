@@ -843,6 +843,16 @@ await check("settings persist the three reader preferences and apply them at the
     "the dialog closes itself once on Escape");
   assert.match(source, /const closeSettings = React\.useCallback\(\(\) => \{[\s\S]{0,180}moreRef\.current\?\.querySelector\("button"\)\?\.focus\(\)/u,
     "closing settings restores focus to the overflow trigger");
+  assert.match(source, /history\.onChange\(\(\) => sync\(\)\)/u,
+    "history changes refresh the back/forward buttons (ViewHistory has no subscribe)");
+  assert.doesNotMatch(source, /history\.subscribe/u, "no dead subscription to a method that does not exist");
+  assert.match(source, /preferencesLoadedRef\.current/u,
+    "a late preferences read cannot roll back a choice the reader just made");
+  const reattach = source.slice(source.indexOf("const parkedRow ="), source.indexOf("// Everything below builds a viewer"));
+  assert.match(reattach, /clearTimeout\(findTimer\.current\)/u, "re-attach cleanup cancels a pending find");
+  assert.match(reattach, /detachHistory\(\)/u, "re-attach cleanup releases the history listener");
+  assert.match(source, /trimmed !== "" && Number\.isFinite\(typed\) \? Math\.max\(0, typed\) : view\.page/u,
+    "stepping from a typed 0 starts at page 1 instead of skipping ahead");
 });
 
 await check("document properties show basic rows before metadata and ignore stale replies", async () => {

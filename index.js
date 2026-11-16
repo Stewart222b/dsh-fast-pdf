@@ -27,7 +27,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { extname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INPUT, translateSelection, translateSelectionStream } from "./translate.js";
 
@@ -76,6 +76,18 @@ const FILE_HEADER = "x-dsh-fast-pdf";
  */
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
 
+/**
+ * Whether a path is absolute in either spelling the Host accepts: POSIX
+ * (`/a/b`), a Windows drive (`C:/a/b`) or a UNC path (`//server/share`).
+ * `node:path`'s `isAbsolute` only understands the current platform, so a
+ * Windows-formatted address would be refused as "需要一个绝对路径" on macOS.
+ * @param path - the decoded path.
+ * @returns true when the Host would treat it as absolute.
+ */
+function isAbsoluteWorkspacePath(path) {
+  return path.startsWith("/") || /^[A-Za-z]:[/\\]/u.test(path) || path.startsWith("\\\\");
+}
+
 /** Header a beacon must carry — same reason as the translation route's. */
 const HELLO_HEADER = "x-dsh-fast-pdf";
 
@@ -109,6 +121,9 @@ function trimBeacons(kind) {
 
 /** Largest beacon body accepted, in bytes. */
 const MAX_BEACON_BODY = 4096;
+
+/** Hard cap on kept reports: per-kind buckets alone cannot bound arbitrary kinds. */
+const MAX_BEACONS = BEACON_LIMIT * 32;
 
 /** Beacons seen since this Host started, oldest first. */
 const beacons = [];
@@ -144,16 +159,20 @@ const MEDIA_TYPES = new Map([
   [".txt", "text/plain; charset=utf-8"],
 ]);
 
-/** Cache of path → `{ etag, size }`, keyed by path and validated by mtime. */
-const digests = new Map();
-
 /**
  * Resolve one URL pathname to a file inside `public/`.
  * @param pathname - request pathname, already known to start with the prefix.
  * @returns the absolute file path, or `undefined` when the path escapes the root.
  */
 function resolveAsset(pathname) {
-  const relative = decodeURIComponent(pathname.slice(ROUTE_PREFIX.length)).replace(/^\/+/, "");
+  let relative;
+  try {
+    relative = decodeURIComponent(pathname.slice(ROUTE_PREFIX.length));
+  } catch {
+    // A malformed escape (`%zz`) must be a 404, not a rejected handler promise.
+    return undefined;
+  }
+  relative = relative.replace(/^\/+/, "");
   if (relative === "" || relative.includes("\0")) return undefined;
   const absolute = normalize(join(PUBLIC_DIR, relative));
   const root = PUBLIC_DIR.endsWith(sep) ? PUBLIC_DIR : PUBLIC_DIR + sep;
@@ -161,7 +180,13 @@ function resolveAsset(pathname) {
 }
 
 /**
- * ETag of one asset, recomputed only when its mtime or size changed.
+ * ETag and bytes of one asset, always read fresh.
+ *
+ * A cache keyed only by `(mtimeMs, size)` served stale bytes when a file was
+ * rewritten at the same size with its mtime restored — exactly what an editor
+ * or a bundler can do — and a page refresh then kept the old viewer. Reading
+ * 2.2 MB off local disk costs under a millisecond, while the ETag still saves
+ * the network transfer on a 304, so correctness wins here.
  * @param path - absolute file path.
  * @returns identity, or `undefined` when the file is missing or unreadable.
  */
@@ -169,20 +194,35 @@ async function identityOf(path) {
   try {
     const info = await stat(path);
     if (!info.isFile()) return undefined;
-    const cached = digests.get(path);
-    if (cached !== undefined && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached;
     const body = await readFile(path);
-    const entry = {
+    return {
       body,
       etag: `"${createHash("sha256").update(body).digest("hex").slice(0, 32)}"`,
       mtimeMs: info.mtimeMs,
       size: info.size,
     };
-    digests.set(path, entry);
-    return entry;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether `If-None-Match` names this entity.
+ *
+ * RFC 9110 §13.1.2 uses the weak comparison for GET/HEAD: a `W/` prefix, a
+ * comma-separated list and `*` all have to match, or a browser/proxy sending
+ * any of them would re-download the 2.2 MB worker it already has.
+ * @param header - the raw `if-none-match` value.
+ * @param etag - this entity's strong ETag.
+ * @returns true when a 304 is due.
+ */
+function revalidates(header, etag) {
+  if (typeof header !== "string") return false;
+  const bare = etag.replace(/^W\//u, "");
+  return header.split(",").some((part) => {
+    const value = part.trim().replace(/^W\//u, "");
+    return value === "*" || value === bare;
+  });
 }
 
 /**
@@ -217,7 +257,7 @@ async function handler(req, res) {
     "last-modified": new Date(asset.mtimeMs).toUTCString(),
     "access-control-allow-origin": "*",
   };
-  if (req.headers["if-none-match"] === asset.etag) {
+  if (revalidates(req.headers["if-none-match"], asset.etag)) {
     res.writeHead(304, headers);
     res.end();
     return;
@@ -229,18 +269,35 @@ async function handler(req, res) {
 
 /**
  * Read a request body as text, refusing anything oversized.
+ *
+ * On an oversized or broken upload the rest of the stream has to be consumed
+ * before replying: an unread body left on a keep-alive socket is parsed as the
+ * next request's start line. The loop drains it to the end while dropping the
+ * chunks, so memory stays bounded.
  * @param req - HTTP request.
  * @returns the body, or `undefined` when it is too large or unreadable.
  */
 async function readBody(req) {
   const chunks = [];
   let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_BODY) return undefined;
-    chunks.push(chunk);
+  let tooLarge = false;
+  try {
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > MAX_BODY) {
+        // Keep draining to the end instead of replying early: an unread body
+        // on a keep-alive socket is parsed as the next request's start line.
+        // Dropping the chunks here keeps memory bounded all the same.
+        tooLarge = true;
+        chunks.length = 0;
+        continue;
+      }
+      if (!tooLarge) chunks.push(chunk);
+    }
+  } catch {
+    return undefined;
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return tooLarge ? undefined : Buffer.concat(chunks).toString("utf8");
 }
 
 /**
@@ -271,14 +328,27 @@ async function helloHandler(req, res) {
   }
   const chunks = [];
   let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_BEACON_BODY) {
-      res.writeHead(413);
-      res.end();
-      return;
+  let tooLarge = false;
+  let broken = false;
+  try {
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > MAX_BEACON_BODY) {
+        // Drain to the end before replying, or the unread tail becomes the
+        // next request on a reused socket.
+        tooLarge = true;
+        chunks.length = 0;
+        continue;
+      }
+      if (!tooLarge) chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch {
+    broken = true;
+  }
+  if (tooLarge || broken) {
+    res.writeHead(tooLarge ? 413 : 400);
+    res.end();
+    return;
   }
   let report;
   try {
@@ -288,8 +358,16 @@ async function helloHandler(req, res) {
     res.end();
     return;
   }
-  beacons.push({ receivedAt: Date.now(), ...report });
+  // Only a plain object is a report. A string, number or array would spread
+  // into character keys, and a forged `receivedAt` would overwrite our clock.
+  if (report === null || typeof report !== "object" || Array.isArray(report)) {
+    res.writeHead(400);
+    res.end();
+    return;
+  }
+  beacons.push({ ...report, receivedAt: Date.now() });
   trimBeacons(String(report?.kind ?? ""));
+  while (beacons.length > MAX_BEACONS) beacons.shift();
   res.writeHead(204, { "cache-control": "no-store" });
   res.end();
 }
@@ -336,34 +414,60 @@ async function translateHandler(ctx, req, res) {
     reply({ ok: false, message: "请求不是合法的 JSON" });
     return;
   }
-  if (input?.stream === true) {
-    // The reader asked to watch the answer arrive. One JSON object per line is
-    // the simplest thing both halves can parse while it is still being written;
-    // `x-accel-buffering: no` keeps a proxy from holding the lines back.
-    res.writeHead(200, {
-      "content-type": "application/x-ndjson; charset=utf-8",
-      "cache-control": "no-store",
-      "x-accel-buffering": "no",
-    });
-    let gone = false;
-    res.on("close", () => {
-      gone = true;
-    });
-    try {
-      for await (const event of translateSelectionStream(ctx, input)) {
-        if (gone) return;
-        res.write(`${JSON.stringify(event)}\n`);
-      }
-    } catch (error) {
-      if (!gone) res.write(`${JSON.stringify({ ok: false, message: String(error?.message ?? error) })}\n`);
-    }
-    res.end();
-    return;
-  }
+  // One controller for the whole request. A reader that closes the card aborts
+  // its fetch; `res`'s `close` event is the only signal this half gets, so it
+  // drives both the response loop and the upstream model stream.
+  const controller = new AbortController();
+  const onClose = () => controller.abort();
+  // Minimal response stubs (the smoke test) have no event API; the real
+  // ServerResponse is an EventEmitter. Guard both so cancellation is wired
+  // wherever it exists without breaking a plain `writeHead`/`end` object.
+  const hasEvents = typeof res.on === "function" && typeof res.removeListener === "function";
+  if (hasEvents) res.on("close", onClose);
   try {
-    reply(await translateSelection(ctx, input));
-  } catch (error) {
-    reply({ ok: false, message: String(error?.message ?? error) });
+    if (input?.stream === true) {
+      // The reader asked to watch the answer arrive. One JSON object per line is
+      // the simplest thing both halves can parse while it is still being written;
+      // `x-accel-buffering: no` keeps a proxy from holding the lines back.
+      res.writeHead(200, {
+        "content-type": "application/x-ndjson; charset=utf-8",
+        "cache-control": "no-store",
+        "x-accel-buffering": "no",
+      });
+      try {
+        for await (const event of translateSelectionStream(ctx, input, { signal: controller.signal })) {
+          if (controller.signal.aborted) break;
+          // Honour backpressure: a slow reader must not let a long translation
+          // pile up unbounded in this process.
+          if (res.write(`${JSON.stringify(event)}\n`) === false && hasEvents) {
+            await new Promise((resolve) => {
+              const done = () => {
+                res.removeListener("drain", done);
+                res.removeListener("close", done);
+                resolve();
+              };
+              res.on("drain", done);
+              res.on("close", done);
+            });
+          }
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          res.write(`${JSON.stringify({ ok: false, message: String(error?.message ?? error) })}\n`);
+        }
+      }
+      // Always finish the response, even when the reader went away mid-stream;
+      // `end()` on a destroyed socket is harmless and keeps the listener paired.
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    try {
+      reply(await translateSelection(ctx, input, { signal: controller.signal }));
+    } catch (error) {
+      if (!controller.signal.aborted) reply({ ok: false, message: String(error?.message ?? error) });
+    }
+  } finally {
+    if (hasEvents) res.removeListener("close", onClose);
   }
 }
 
@@ -396,9 +500,17 @@ function parseFileAddress(address) {
       };
     }
     if (scope === "absolute") {
-      const segments = parts.map((part) => decodeURIComponent(part));
+      // Match the Host's `dsh-util-workspace-path` grammar: an empty first
+      // segment with more behind it is a UNC path's `//`, a first segment like
+      // `C:` is a Windows drive, and every other POSIX path needs its leading
+      // slash put back. Without these three cases an absolute address never
+      // passes the path check and the file route answers 400.
+      const unc = parts[0] === "" && parts.length > 1;
+      const segments = (unc ? parts.slice(1) : parts).map((part) => decodeURIComponent(part));
       if (segments.length === 0 || segments[0] === "") return null;
-      return { scope, sessionId: "", path: segments.join("/") };
+      if (unc) return { scope, sessionId: "", path: `//${segments.join("/")}` };
+      const drive = /^[A-Za-z]:$/u.test(segments[0]);
+      return { scope, sessionId: "", path: drive ? segments.join("/") : `/${segments.join("/")}` };
     }
   } catch {
     return null;
@@ -492,7 +604,7 @@ async function fileHandler(ctx, req, res) {
       : parsed.scope === "session"
         ? resolve(workspaceRootFor(ctx, parsed.sessionId), parsed.path)
         : parsed.path;
-  if (wanted === "" || wanted.includes("\0") || !isAbsolute(wanted)) {
+  if (wanted === "" || wanted.includes("\0") || !isAbsoluteWorkspacePath(wanted)) {
     reply(400, { ok: false, code: "path", message: "需要一个绝对路径" });
     return;
   }

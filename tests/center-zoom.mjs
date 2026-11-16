@@ -141,3 +141,23 @@ assert.ok(Math.abs(pinchAfter.point[1] - pinchBefore.point[1]) < 1e-6, "pinch at
 const edge = makeViewer({ scrollTop: 0, scrollLeft: 0, width: 1000, height: 1400 });
 edge.setZoom("500", { silent: true });
 assert.ok(edge.wrapEl.scrollTop >= 0 && edge.wrapEl.scrollLeft >= 0, "restored scroll positions should clamp at document edges");
+
+// The horizontal gap outside a narrow page box must scale with zoom just like
+// the vertical page-gap does. A wide pane with a narrow page puts the viewport
+// centre in that side margin.
+{
+  const narrow = makeViewer({ zoom: 1, width: 120, height: 1000, scrollTop: 100, scrollLeft: 800 });
+  // Put a second, wider page after the narrow one so the anchor lands in a
+  // mixed-width layout, and force a large horizontal gap.
+  narrow.pageEls[0].offsetLeft = 0;
+  narrow.wrapEl.scrollLeft = 800;
+  const anchor = narrow.captureZoomAnchor();
+  assert.ok(anchor.gapX > 0, "the viewport centre sits outside the narrow page box");
+  narrow.zoom = 2;
+  // Recompute the page box for the new zoom, as applyPageLayout() would.
+  narrow.pageEls[0].offsetWidth = 120 * 2;
+  narrow.restoreZoomAnchor(anchor);
+  const expected = Math.max(0, narrow.pageEls[0].offsetLeft + anchor.pageX * 2 + anchor.gapX * 2 - narrow.wrapEl.clientWidth / 2);
+  assert.ok(Math.abs(narrow.wrapEl.scrollLeft - expected) < 1e-6,
+    `horizontal gap must scale with zoom: got ${narrow.wrapEl.scrollLeft}, expected ${expected}`);
+}

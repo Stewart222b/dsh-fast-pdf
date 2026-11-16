@@ -207,4 +207,61 @@ assert.equal(classifyTranslationMode("short 中文短语"), "term");
   assert.doesNotMatch(requests[1].system, /bilingual dictionary/i);
 }
 
+// A PDF tab whose own session has ended must not borrow another session's
+// provider/model; the global default is the right fallback.
+{
+  const other = { session: { requestHeader: () => ({ config: { provider: "p-OTHER", model: "m-OTHER" } }) } };
+  const ctx = {
+    get(name) {
+      if (name === "agents") return { get: () => undefined, list: () => [other] };
+      if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p-default", model: "m-default" }) };
+      return undefined;
+    },
+  };
+  const { pickModel } = await import("../translate.js");
+  assert.deepEqual(pickModel(ctx, "s-missing"), { provider: "p-default", model: "m-default", from: "default" });
+  // With no session id at all, the first live agent is still the best guess.
+  assert.deepEqual(pickModel(ctx, undefined), { provider: "p-OTHER", model: "m-OTHER", from: "session" });
+}
+
+// A malformed delta must never reach the bubble as "undefined"/"[object Object]".
+{
+  const agent = { session: { requestHeader: () => ({ config: { provider: "p", model: "m" } }) } };
+  const make = (chunks) => ({
+    get(name) {
+      if (name === "llm") return { async resolveModelInfo() { return {}; }, async *stream() { for (const c of chunks) yield c; } };
+      if (name === "agents") return { get: () => agent, list: () => [agent] };
+      return undefined;
+    },
+  });
+  const input = { text: "Hello world this is a passage", sessionId: "s1" };
+  assert.equal((await translateSelection(make([{ type: "text-delta" }]), input)).ok, false);
+  assert.equal((await translateSelection(make([{ type: "text-delta", text: { a: 1 } }]), input)).ok, false);
+  assert.equal((await translateSelection(make([{ type: "text-delta", text: "OK" }]), input)).text, "OK");
+}
+
+// An aborted reader stops the stream generator without hanging on a stalled model.
+{
+  const agent = { session: { requestHeader: () => ({ config: { provider: "p", model: "m" } }) } };
+  const ctx = {
+    get(name) {
+      if (name === "llm") return {
+        async resolveModelInfo() { return {}; },
+        stream() { return (async function* () { yield { type: "text-delta", text: "A" }; await new Promise(() => {}); })(); },
+      };
+      if (name === "agents") return { get: () => agent, list: () => [agent] };
+      return undefined;
+    },
+  };
+  const controller = new AbortController();
+  const gen = translateSelectionStream(ctx, { text: "Hello world this is a passage", sessionId: "s1" }, { signal: controller.signal });
+  assert.deepEqual((await gen.next()).value, { delta: "A" });
+  controller.abort();
+  const settled = await Promise.race([
+    gen.next().then((step) => `step:${step.done}`),
+    new Promise((resolve) => setTimeout(() => resolve("timeout"), 500)),
+  ]);
+  assert.notEqual(settled, "timeout", "an aborted reader must not leave the generator waiting on the model");
+}
+
 console.log("translation reasoning options passed");
