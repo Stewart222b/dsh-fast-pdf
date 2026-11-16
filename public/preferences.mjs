@@ -3,12 +3,22 @@ export const PREFERENCES_KEY = "dsh-fast-pdf.preferences.v1";
 
 export const DEFAULT_PREFERENCES = Object.freeze({
   translationLanguage: "auto",
-  defaultZoom: "page-fit",
+  defaultZoom: "page-width",
   pageGap: 14,
 });
 
 const LANGUAGES = new Set(["auto", "zh", "en"]);
-const ZOOMS = new Set(["page-fit", "page-width", "50", "75", "100", "125", "150", "175", "200", "250", "300"]);
+const ZOOMS = new Set(["page-width", "50", "75", "100", "125", "150", "175", "200", "250", "300"]);
+
+/**
+ * Zoom modes that used to be saved and no longer exist.
+ *
+ * A preference file outlives the build that wrote it: a reader who chose
+ * `page-fit` before it was removed would otherwise fall back to the default,
+ * which is the very mode they were trying to leave. Mapping the old name keeps
+ * the closest thing to what they picked.
+ */
+const RETIRED_ZOOMS = new Map([["page-fit", "page-width"]]);
 
 function normalize(input) {
   // Only a plain object is a preference bag. An array, Date or string would
@@ -24,7 +34,8 @@ function normalize(input) {
       ? Number(rawGap)
       : Number.NaN;
   const rawZoom = value.defaultZoom;
-  const zoom = typeof rawZoom === "number" ? String(rawZoom) : typeof rawZoom === "string" ? rawZoom : "";
+  const stored = typeof rawZoom === "number" ? String(rawZoom) : typeof rawZoom === "string" ? rawZoom : "";
+  const zoom = RETIRED_ZOOMS.get(stored) ?? stored;
   return {
     translationLanguage: typeof value.translationLanguage === "string" && LANGUAGES.has(value.translationLanguage)
       ? value.translationLanguage

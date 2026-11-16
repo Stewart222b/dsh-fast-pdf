@@ -143,11 +143,15 @@ globalThis.ResizeObserver = class {
   observe() {}
 };
 let resizeZoomCalls = 0;
-const widthViewer = { pinch: null, zoomMode: "page-width", setZoom(mode, options) {
-  resizeZoomCalls += 1;
-  assert.equal(mode, "page-width");
-  assert.equal(options.silent, true);
-} };
+const widthViewer = { pinch: null, zoomMode: "page-width",
+  // No pages yet: a viewport that cannot preview falls back to the full
+  // commit, which is the path this check is about.
+  previewResize() { return false; },
+  setZoom(mode, options) {
+    resizeZoomCalls += 1;
+    assert.equal(mode, "page-width");
+    assert.equal(options.silent, true);
+  } };
 const widthWatcher = new Function("viewerRef", "frame", "disposed", "sync", "requestAnimationFrame",
   `let resizeObserver;\n${widthSource}\nreturn watchWidth;`)(
     { current: widthViewer }, frame, false, () => {}, (fn) => { widthRafs.push(fn); return widthRafs.length; },
@@ -180,7 +184,8 @@ assert.equal(view.scale, viewer.zoom, "cancel restores the committed numeric zoo
 assert.equal(view.mode, "page-width", "cancel does not replace the saved fit mode");
 assert.equal(Number.isNaN(view.scale), false, "fit-mode cancellation cannot produce NaN");
 assert.equal(viewer.setZoomCalls.length, setZoomCallsBeforePreview, "preview UI updates never call setZoom");
-assert.match(source, /scale: viewer\.pinch\?\.target \?\? viewer\.zoom/u, "other viewer notifications preserve the active preview scale");
+assert.match(source, /scale: viewer\.pinch\?\.target \?\? viewer\.resize\?\.target \?\? viewer\.zoom/u,
+  "other viewer notifications preserve the active preview scale, gesture or resize");
 assert.match(source, /viewer\.onZoomPreview = updateZoomPreview;\s*viewer\.onPinchCommit = sync;/u,
   "reattached viewers receive the current component's preview and commit callbacks");
 console.log("wheel pinch: compositor preview, one settled commit, paused queue, and ordinary scrolling verified");

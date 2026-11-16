@@ -31,8 +31,12 @@ DSH 侧的 PDF 阅读器：默认接管右侧预览里的 `.pdf`，内置 PDF �
 
 | 路径 | 作用 |
 |---|---|
-| `index.js` | 宿主半边：`/fast-pdf` 静态路由（ETag、HEAD、405、路径越界拒绝）+ `POST /fast-pdf/translate` |
+| `index.js` | 宿主半边：`/fast-pdf` 静态路由（ETag、HEAD、405、路径越界拒绝）+ `POST /fast-pdf/translate` + `POST /fast-pdf/sync`（页面文本上行）+ `POST /fast-pdf/work`（给浏览器派渲图任务）|
 | `translate.js` | 划词翻译：按会话正在用的 provider/model 调 `ctx.llm.stream` |
+| `documents.js` | 宿主侧的页面文本存储：按 `docId` 缓存、按会话排队、检索与目录过滤。**不 import `public/search.mjs`** —— 那份带高亮所需的字符映射，宿主只需要「在第几页」|
+| `tools.js` | 五个工具的纯定义对象（`pdf_search` / `pdf_read_pages` / `pdf_outline` / `pdf_page_image` / `pdf_list`），手写 `ToolDefinition` 而不是 `import { defineTool }` |
+| `bridge.js` | 宿主 → 浏览器的图像通道，方向反过来的请求/响应：pane 挂一个长请求等活儿，宿主有渲图需求时作答 |
+| `http-body.js` | 带上限的请求体读取（翻译 96 KB、页面文本 8 MB，两个上限各有理由）|
 | `client.js` | 注册 `.pdf` 预览 + 文档体；工具栏、目录、查找、划词气泡；按需加载渲染器 |
 | `public/viewer.mjs` | 上游 `viewer.js` 的移植（改 import 路径、i18n，末尾把 `ViewHistory` 一并导出） |
 | `public/search.mjs` `pdf-viewport.mjs` `history.mjs` | 上游同目录模块，原样搬入 |
@@ -43,6 +47,7 @@ DSH 侧的 PDF 阅读器：默认接管右侧预览里的 `.pdf`，内置 PDF �
 | `tests/client-smoke.mjs` | 无头自检（路由、模块图、注册、主题令牌） |
 | `tests/host-route-live.mjs` | 把宿主半边架在真 socket 上：路由匹配、媒体类型、304、越界、翻译往返；`--serve` 模式还能给浏览器当静态服务器 |
 | `tests/install-check.mjs` | 不开 GUI 也能答的一个问题：profile 那侧是不是真的接上了这个包 |
+| `tests/document-tools.mjs` | 文档那一半的无头自检：文本存储、检索、五个工具、渲图通道、sync 路由 |
 | `tests/host-live.mjs` | 对着跑着的 GUI 验宿主半边是否真的加载了（`--page` 读页面自报的接管顺序） |
 | `tests/browser/` | 面板自检场：`index.html` 二十个场景 + `drive.mjs`（无头 Edge 的 CDP 驱动）+ `run-scenario.ps1`（一条命令跑一个场景）+ `make-samples.mjs`（生成样本 PDF） |
 | `cordis.patch.yml` | 插件挂载点 |
@@ -133,6 +138,32 @@ primitives.Button; primitives.Tooltip; primitives.IconSearchOutlineRegular; prim
 
 `translate.js` 里没有一行 `@deepseek-ai/*` 的顶层 import：桌面版 profile 是 `autoInstallPeers: false`，这些包是可选 peer，顶层 import 失败会**让整条插件不激活**（连 PDF 预览一起没了）。所以服务一律在请求时用 `ctx.get()` 取，拿不到就降级成一句提示。
 
+## 问文档：把文档交给对话，而不是自己再做一个问答
+
+选中文字 → 气泡里除了「翻译」还有「问这段」。它不弹自己的对话框：把「《文档名》第 N 页」加选中的文字一起放进 DSH 的输入框，剩下的就是正常的对话。这样追问、换模型、看引用历史、改主意重问，都是对话本来就有的能力，插件不必再实现一遍。
+
+**为什么不是插件自己问答。** 上游那份扩展是自己跑 agent 循环的：它持有 API key、自己检索、自己排轮次。DSH 里这三样都不归插件 —— 模型和会话在宿主手里，插件没有 key，也不该有。所以这里把「读这份 PDF」降级成五个工具，由对话里的模型自己决定调哪个：
+
+| 工具 | 回答的问题 |
+|---|---|
+| `pdf_search` | 「哪几页提到了这个词」—— 按页报，一页一条 |
+| `pdf_read_pages` | 「把 3 到 7 页读出来」—— 支持 `3-7`、`3,7-9`，一次最多 12 页 / 24k 字符 |
+| `pdf_outline` | 「这份文档怎么组织的」—— 目录，可按词过滤 |
+| `pdf_page_image` | 「这一页长什么样」—— 渲成图交给视觉模型；当前模型不看图时返回一句说明而不是报错 |
+| `pdf_list` | 「这个会话读过哪些文档」—— 多份文档时用它拿到 `docId` |
+
+**文本怎么到宿主。** 这是整件事里唯一不显然的地方。工具在宿主里跑，而 PDF 是浏览器解析的（宿主没有 canvas，`public/pdf.mjs` 是浏览器构建，在 Node 下导入即崩：`hashOriginal.toHex is not a function`）。而 typert 的 Remote 是单向的（`TypertRemoteContribution` 是 Host-for-Client），**宿主没有「调用客户端」这回事**。于是反过来了：浏览器把页面文本推上去。
+
+阅读器本来就在建全文索引（查找栏要用），那份索引里只取 `text`，按批 `POST /fast-pdf/sync`，一批 120 页 / 1.5 MB 字符，**每批确认之后才推进游标**。这一点不是洁癖：构建批次和推进游标写在同一个循环里会少一行，但失败的批次会把它的页留在游标后面，而没有任何东西会再要它们 —— 文档看起来是完整的，那几页却永远不在。索引是边扫边推的，所以 779 页的手册在第一页读完时就能被问到，不用等整个扫描结束。
+
+**图怎么回去。** 同样是被反转的方向，只是这次是宿主有事要找浏览器：`pdf_page_image` 把一个渲图任务放进队列，pane 挂着的那个长请求正好拿到它，渲完 `POST /fast-pdf/work` 回来。一次只挂一个请求，就是普通的请求/响应，所以桌面版的 IPC 桥也能承载（它不一定转发 WebSocket upgrade）。pane 关掉时 `bye` 会结算所有排队任务，工具拿到的是「pane 已经关了」，不是等到超时。
+
+**哪来的 docId。** `d` + 一段 FNV-1a 哈希，输入是文件地址和 pdf.js 的 fingerprint。地址命名文件，fingerprint 在字节变化时变化 —— 所以同一个文件重开命中原文本，改过的文件是一个新文档。会话最多留三份，最旧的被挤掉。
+
+**一份手册开在两个对话里，存两份。** 这个 `docId` 里没有会话：地址是 `dsh-resource://file/session/<sessionId>/<path>`，哈希出来的字符串两个对话会算成同一个（地址里那个 session 段是"谁在问这份文件"，不是"文件是谁的"）。所以存储的键是**会话加 docId 两段**，不是一个 docId。原先只按 docId 存，后写的那个会话会把 `sessionId` 盖掉 —— 前一个对话刚索引完的手册会从它的 `pdf_list` 里消失，没有任何报错。两份的代价是页文本存两遍（779 页那份是 559 KB），这个仓库在这个地方的选择是"读的人能查准"优先于"省一份缓冲区"。断言在 `tests/document-tools.mjs` 的 `two sessions sending one document id keep separate copies`：两个会话写同一个 id，各读各的文本，且后写的一方不搬走所有权。
+
+**降级都有话说。** 没开文档、文档还没索引到那一页、这一页没有文本层（扫描件）、宿主没有 `tools` 服务、当前模型不接受图像 —— 每一条都是一句话，写在工具结果里给模型读，而不是抛异常把这一轮对话打断。`tools` 服务是可选依赖：拿不到时 PDF 预览照常工作，只是对话里看不见这份文档。
+
 ## 阅读手势
 
 两件阅读时最常做的事，各有一条明确的路：
@@ -141,6 +172,27 @@ primitives.Button; primitives.Tooltip; primitives.IconSearchOutlineRegular; prim
 - **复制出来是纯文本**：页面文字在 pdf.js 的文本层里是一行一个定位 `<span>`，浏览器默认会把这份 DOM 连同 `text/html` 和"每行一个换行"一起写进剪贴板。面板在 `.fp-frame` 上接住 `copy`，只写 `text/plain` 并 `preventDefault()`，内容是 `toString()` 重新排过的一份：拉丁片段之间补一个空格，CJK 之间不补（两个汉字之间加空格本身就是错字）。
 
 这条的断言分两处。`client-smoke.mjs` 把 `selectionPlainText` 从 bundle 源码里提出来直接调（真字符串、真换行），"换行有没有多余"在那里量；`tests/browser` 的 `copy` 场景量的是另一件事——面板认领了这个事件、只写纯文本一种、页面之外的选区一概不碰。合成分发的 `copy` 写不进真剪贴板（浏览器拿自己序列化的选区填 `text/plain`，`transferIsBrowserFilled=true` 就是这个意思），与其假装量到了，不如把这条边界写在场景里。
+
+### 拖分栏：拖动时只做合成器变换，停手才重排
+
+分栏拖拽改的是面板宽度，而 `page-width` 模式的倍率就是宽度除以页宽——**每一次 `ResizeObserver` 回调都会算出新的倍率**。照直走 `setZoom` 的代价在 779 页的文档上非常直白：清掉每一页的已渲染标记、隐藏每一个文本层、重写 779 个页盒的 `width`/`height` 与 `--scale-factor`，然后把可见页**强制**重新栅格化一遍。拖动一秒六十帧，这套账单就付六十遍，而屏幕上真正需要的只是把已有的栅格按比例缩放。
+
+所以拖动走的是和 pinch 手势同一条路：`previewResize()` 只在 `pagesEl` 上写 `transform: scale(target / zoom)`，锚点取视口中心，160 ms 没有新的宽度读数才 `commitResize()`——那时才付一次 `setZoom`，并把锚点恢复回去。三点值得记下：
+
+- **`computeZoom` 现在接参数**（`computeZoom(mode = this.zoomMode)`）。预览要的是"新宽度会算出什么倍率"，但 `this.zoom` 必须继续描述屏幕上那份布局，否则 `restoreZoomAnchor` 会按一个还没生效的倍率去算坐标。
+- **预览期间不发渲染**。`previewResize()` 会取消正在跑的 job，因为按旧倍率画出来的 canvas 在提交那一刻就要丢掉；`renderPage` 本来也有 `if (this.pinch) return` 的短路，resize 走的是另一条。
+- **`setZoom`、`close()`、`commitResize` 都先 `cancelResize()`**。留着一个过期的 transform，新的布局会被缩放第二次；而 `commitResize` 额外检查 `this.wrapEl?.isConnected`——面板被 park 之后页盒还在、包裹节点已经离开文档，这时重排 779 页没有人会看见。
+
+固定百分比（`100`、`150` 之类）不走预览：那种模式下文档宽度不跟随面板，拖动本来就不该改变它，`previewResize()` 直接返回 `false`，调用方照旧 `setZoom`。
+
+**「适应宽度」是一个模式，不是一次动作**，所以工具条上那个按钮亮着（`pressed: view.mode === "page-width"`），再按一次就灭。这一点是被读者问出来的两层：
+
+- 第一层：「点了适应宽度之后拖动分栏，页面又跟着缩放，看起来像按钮失效了，再点一下加号才好」。其实两件事都对——模式在生效时本来就该跟着宽度走，加号之所以"修好"它，是因为加号把模式换成了固定百分比。缺的是**状态可见**：`view.mode` 因此重新进了 `sync()` 的投影。上一轮清理死代码时它恰好被删过，所以这里留了注释。
+- 第二层：「高亮太不明显，而且不能点一下取消，就不能做得像搜索的大小写那个按钮吗」。两处都改了：按钮现在按**查找栏那两个开关**的样子点亮（强调色文字 + 13% 强调色填充 + 48% 的内描边，`public/viewer.css`），再按一次就把当前倍率定住、退出模式——和 `Aa`/`ab` 的开关语义一致。定住时用的是**四舍五入后的整数百分比**，也就是读数上那个数，所以按下前后工具栏显示的百分比不变。
+
+顺带修掉一个更基础的问题：原来的规则挂在 `[data-pressed]` 上，而宿主的 `Button` 只转发 `aria-pressed`（`pressed` 是它唯一转发的状态，`⋯` 按钮就靠这个），所以**在宿主路径下那条规则从来没命中过**，只有无宿主的降级 `<button>` 才会亮。现在两个选择器都在。
+
+`client-smoke.mjs` 的 `a resize previews on the compositor and commits once, not per frame` 把这条钉在源码层面：常量是 160 ms、`computeZoom` 收参数、预览函数体里**不许**出现 `applyPageLayout`/`renderVisible`/`renderedZoom`/`textLayers.values`。断言读源码而不是跑行为，是因为要跑就得伪造 779 个页盒与一个能测时间的 ResizeObserver——那套假壳能证明的事情比这两行正则少。
 
 ## 从自己那份扩展搬过来的七样
 
@@ -231,14 +283,34 @@ node tests\host-route-live.mjs --serve 8899 tests\browser
 
 ## 自检
 
-不需要开 GUI，四条命令：
+不需要开 GUI，六条命令：
 
 ```powershell
 node tests\client-smoke.mjs        # 直接调 handler，假 req/res
+node tests\document-tools.mjs      # 文本存储、检索、五个工具、渲图通道
+node tests\reattach-paint.mjs      # 切回时那一帧：该省的排版权一次都不能多
 node tests\install-check.mjs       # 从 profile 出发，照加载器的方式把包解析一遍
 node tests\host-route-live.mjs     # 真的 http 服务 + 真 socket
 node tests\visual-diff.mjs a.png b.png    # 两张同尺寸截图，只回答「变了多少」
 ```
+
+`npm test` 跑十六个：上面五个（`visual-diff.mjs` 除外，它是给人用的比较器，自己那十一条断言在 `visual-diff-test.mjs`）加下面十一个。剩下的两个不在里面——`host-live.mjs` 要一个活着的宿主，`visual-diff.mjs`、`browser/` 那一套要浏览器和截图，都不该拖住一条 `npm test`。
+
+```powershell
+node tests\center-zoom.mjs         # 缩放锚点：放大缩小时光标下的那一行不动
+node tests\pinch-spacing.mjs       # 捏合预览期间的页间距
+node tests\preferences.mjs         # 偏好文件的读写与旧值迁移（`page-fit` → `page-width`）
+node tests\render-queue.mjs        # 渲图队列：并发上限、取消、重用旧位图
+node tests\reattach-paint.mjs      # 见上
+node tests\scroll-diagnostics.mjs  # 滚动诊断事件
+node tests\scroll-lookup.mjs       # 按位置反查是第几页
+node tests\search-navigation.mjs   # 查找命中之间怎么跳
+node tests\translation-options.mjs # 翻译的目标语言与提示词拼装
+node tests\viewer-reattach.mjs     # 视图器挂起再挂回的状态保留
+node tests\wheel-pinch.mjs         # Ctrl+滚轮：合成器预览、停手提交、暂停队列
+```
+
+全量跑一遍约 11 秒、99 条 `ok`。**这一轮补的正是这个缺口**：`npm test` 原来只跑三个文件，剩下的十几份里 `wheel-pinch` 早在 resize 预览那一轮就坏了——假 viewer 少了 `previewResize`，断言还停在 `viewer.pinch?.target ?? viewer.zoom`——因为它不在 `npm test` 里，一直没人发现。一条没人跑的命令迟早会烂。
 
 浏览器那套场景要先有样本。样本全是 `make-samples.mjs` 现搓的，但其中 34 MB 的 `huge.pdf` **不在仓库里**（`.gitignore` 挡着，为了不让 clone 背 34 MB），所以第一次跑之前：
 
@@ -479,6 +551,40 @@ failedShown=true failedText=这个 PDF 打不开文件不是有效的 PDF，或�
 
 **加这条路由意味着宿主半边也变了**：客户端刷新页面就够，但 `index.js` 是在 Harness 启动时加载的，所以新路由要**重启 DeepSeek Harness** 才存在（见下面「改完的东西什么时候生效」）。
 
+#### 文件为什么会被读两遍：版本号不是随便填的
+
+用户报「进度条会加载两次，而且加载成功后还会再短暂出现一次」。第一次是正常的，第二次不是——`/fast-pdf/hello` 里明明白白两条 `body-bytes` 和两条 `runtime-viewer-build`，也就是说整份文件真的被重新读了一遍、视图器真的被重建了一遍。
+
+原因是 `renderer` 握手对象里的那个 `loaded(version)`。宿主拿这个 `version` 跟**它自己 `useResource` 拿到的版本**比：
+
+```js
+const observedVersion = meta.value?.version;
+const changed = current?.version !== void 0 && observedVersion !== void 0
+  && observedVersion !== current.version && observedVersion !== current.observedVersion
+  || state?.resourcesDirty === true;
+```
+
+`changed` 为真、且 `autoRefresh` 开着（默认 `true`）、且当前不在 loading —— 宿主就调 `reload()`，把 `revision` 推进一格。我们的正文把 `revision` 放在读文件 effect 的依赖里，于是整条「读文件 + 建视图器」链条重跑一遍：第二条 `body-bytes`、第二条 `runtime-viewer-build`、第二个进度条。
+
+而我们当时上报的是常量 `1`，宿主上报的是 `dev:ino:size:mtimeNs:ctimeNs`。**常量永远不等于那个 token**，所以每一次元数据刷新都被判成「文件变了」。更糟的是第一轮 `prepareRenderer` 时 `useResource` 还没拿到值，`observedVersion` 记的是 `undefined`——这条兜底也失效了。
+
+修法不是加个标志位捂住第二个进度条，而是让两边说的是同一个数：`POST /fast-pdf/file` 的响应多给一个 `x-dsh-fast-pdf-version` 头（`stat(path, { bigint: true })` 拼出来的同一个格式），正文把它原样回给 `loaded()`。整条链只有一种情况还会重载——文件真的被改了。
+
+```js
+const ns = await stat(wanted, { bigint: true });
+version = `${ns.dev}:${ns.ino}:${ns.size}:${ns.mtimeNs}:${ns.ctimeNs}`;
+```
+
+三种情形用宿主的五个动作（`fresh` / `reset` / `loading` / `rendered` / `changed`）跑过：
+
+```
+unchanged file  -> changed: false   (no second load)
+edited file     -> changed: true    (real edits still reload)
+old constant 1  -> changed: true    (the bug: every frame looked changed)
+```
+
+`bigint` 那一位是有意义的：普通的 `stat` 把时间截到 `mtimeMs`，拼出来的不是宿主那个 token。响应头还带了 `access-control-expose-headers`——跨源读时自定义响应头默认拿不到，漏了这一行会静默退回旧常量，等于把刚修掉的毛病原样放回去。
+
 ### 它自己会说：`/fast-pdf/hello`
 
 客户端插件天生是哑的。bundle 没加载、id 写错、默认位丢了——从外面看全都一样：预览器还是内置那个，没有任何地方写一行字。所以我给它装了一条嘴：
@@ -604,7 +710,7 @@ ok  the live route translates with this session's model — swzc-tech / DeepSeek
 
 M0 / M1 / M2 的代码都已完成：
 
-- 连续滚动、惰性渲染、缩放（含 Ctrl+滚轮）、适应宽度/整页；页面双击不触发缩放，为浏览器原生选词保留默认事件；
+- 连续滚动、惰性渲染、缩放（含 Ctrl+滚轮）、适应宽度；页面双击不触发缩放，为浏览器原生选词保留默认事件；
 - 复制选中文字只带走纯文本（没有富文本，也没有每行一个换行）；
 - 目录：文档带 outline 时工具栏多一个目录键，点条目跳转；**目录是浮在文档上的一层**，不挤窄页面（右侧栏本来就没多宽，挤一下版面就全变了），开合带 140 ms 的淡入；节点能逐个折叠，折开是三排数不动的 160 ms 高度过渡（`grid-template-rows: 1fr → 0fr`，向上游学的动画），也有「展开全部 / 折叠全部」；当前读到的那一章高亮；
 - 页码可以直接输入跳转：框里是当前页，右边是总页数；
@@ -614,7 +720,9 @@ M0 / M1 / M2 的代码都已完成：
 - 阅读位置：每个标签页记住页码与滚动位置，关掉再打开接着读；
 - 划词翻译：见上一节。请求带 60 秒上限（真测过 4.5k 字符要 13 秒，所以上限给得宽），超时就落到出错的卡片并给「重试」，不会永远停在「翻译中…」；
 - 加密 PDF：不再直接报错，出一张卡片要密码；填错提示"密码不对"，取消则说明没打开，可以重试；
-- 标签页字节保留：和内置预览器一样占一个 retention 席位，切走再切回不重读文件；
+- 标签页字节保留：和内置预览器一样占一个 retention 席位，切走再切回不重读文件；**切回时也不再闪一下进度条**——缓存里的那一份接回来要两百毫秒左右，而首帧原来一律画成「加载中」，手上又没有字节数，于是画出来的是横扫的那条不确定进度条，而不是刚看完的 0-100。现在首帧先问缓存：这一份还开着就直接以就绪状态出现（`peekOpenDocument`，只看不取，取走是重挂载那一步的事）；缓存里那份过期了（换了视图器构建、字节不同），重建路径自己会把状态改回「加载中」。
+- **切回时那一下黑：不是缺进度条，是画了一帧空框**——`fp-frame` 由 React 渲染但刻意不含子节点（页面容器是视图器建的），而把容器接回去的代码在**被动** effect 里（它得先有 `bytes`）。React 先画、被动 effect 后跑，中间那帧就是 `.fp-frame` 的底色：亮色下是 `#ebeef2`，暗色下是 `#151517` 一片黑。修法不是盖一条进度条，而是让容器在**同一次渲染里**就位：`React.useLayoutEffect` 在浏览器绘制**之前**跑，把 `cachedPages` 直接 `appendChild` 回 `frameRef.current`（条件与重建路径完全一致——有页、有字节、`moduleRevision` 相同——所以不可能显示一个紧接着就要被丢掉的容器）。这样切回是「上一帧还有页面，下一帧还是那批页面」。
+- **切回时那一次多余的重栅格化**：`setZoom` 原来无条件对每一页 `delete el.dataset.renderedZoom`、清 `.hlLayer`、`hide()` 每个文本层、`applyPageLayout()` 重写全部页盒，再 `renderVisible(true)` 强制重画可见页。重挂载调用它只是**担心**文档挂着的时候面板宽度变了，而通常根本没变。同一个模式、同一个尺寸进来，屏上的东西本来就是对的，这笔工作（779 页）纯粹是白做——读者看到的就是「黑一下，然后同样的像素回来」。现在 `setZoom` 在模式与缩放都没变时早退，只 `renderVisible()`（不 `force`，已有位图的页由 `renderPage` 自己跳过）；真的改过宽度才走完整路径。同理 `applyReadingPosition` 恢复滚动位置时不再 `force`——移动视口不失效任何一张位图。
 - 打开时那一行会说清楚在等什么：读字节时报「已收到 128 KB / 4.2 MB · 3%」（宿主给了 Content-Length 才是确切百分比，否则进度条横扫），字节齐了改成「正在排版…」。
 
 ### 七个报上来的毛病
@@ -648,7 +756,7 @@ M0 / M1 / M2 的代码都已完成：
 
 | 项 | 结果 |
 |---|---|
-| 挂起来 | `mount`：`plain.pdf` 4 页 → 4 个 canvas、`1 / 4`、工具栏按 `aria-label` 读出 `查找 后退 前进 上一页 下一页 缩小 放大 整页显示 更多`（`更多` 在最右，`文档属性` 收在它里面）、缩放 67%、`frameHeight=683`、`toolbarOneRow=true`、`pagerOneRow=true`；没目录的文档不出现目录按钮（`outlineButtonAppeared=false`）；打开途中那行读过 `loadingSeen=正在打开`（本机 34 MB 的 `huge.pdf` 走插件自己的路由，字节到得太快，只抓到准备阶段；百分比那段由 `client-smoke.mjs` 按 `loadingState` 的入参/出参单独量） |
+| 挂起来 | `mount`：`plain.pdf` 4 页 → 4 个 canvas、`1 / 4`、工具栏按 `aria-label` 读出 `查找 后退 前进 上一页 下一页 缩小 放大 适应宽度 更多`（`更多` 在最右，`文档属性` 收在它里面）、缩放 67%、`frameHeight=683`、`toolbarOneRow=true`、`pagerOneRow=true`；没目录的文档不出现目录按钮（`outlineButtonAppeared=false`）；打开途中那行读过 `loadingSeen=正在打开`（本机 34 MB 的 `huge.pdf` 走插件自己的路由，字节到得太快，只抓到准备阶段；百分比那段由 `client-smoke.mjs` 按 `loadingState` 的入参/出参单独量） |
 | 翻页 | `nav`（12 页）：连点两次「下一页」1 → 3，一次「上一页」回 2，同一帧内的两次点击也合成 1 步 |
 | 缩放 | `nav`：`+` → 75%，点适应按钮回 67% |
 | 双击 | `dblclick` 断言已更新：页面合成双击不被取消、倍率不变、既有选区保留；工具栏双击不改变倍率。本轮未重跑浏览器场景，也未验证原生选词 |

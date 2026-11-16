@@ -11,3 +11,6 @@ fp-run-*/
 .DS_Store
 Thumbs.db
 *.swp
+
+# Ad-hoc probes: session cookies and captured responses, never committed
+.perf/

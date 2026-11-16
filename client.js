@@ -36,8 +36,17 @@ window.__ModuleLoader__.load({
     const SELECTION_LIMIT = 6000;
     /** How long a translation may stay unanswered before the card offers a retry. */
     const TRANSLATE_TIMEOUT_MS = 60000;
-    /** Width of the translate pill, and the one line of height it takes. */
-    const PILL_WIDTH = 92;
+    /**
+     * Width of the selection pill, and the one line of height it takes.
+     *
+     * Two offers, 翻译 and 问这段, side by side. The width is reserved up front
+     * because the placement rules need to know how wide the bubble is before it
+     * has drawn: it is what decides whether the pill fits to the right of the
+     * anchor or has to flip. It is measured in the widest case — two Latin
+     * offers — and the pill still shrinks to its button text in a narrow pane,
+     * since `.fp-chip` is the flex container the buttons share.
+     */
+    const PILL_WIDTH = 168;
     const PILL_HEIGHT = 30;
     /** Width and tallest height of the translation card — mirror `.fp-pick-card`. */
     const CARD_WIDTH = 300;
@@ -114,7 +123,6 @@ window.__ModuleLoader__.load({
       historyBack: "M6.5 3.5 3 7l3.5 3.5M3 7h6a4 4 0 0 1 0 8H6",
       historyForward: "M9.5 3.5 13 7l-3.5 3.5M13 7H7a4 4 0 0 0 0 8h3",
       fitWidth: "M2.5 4v8M13.5 4v8M5 8h6M6.8 6.2 5 8l1.8 1.8M9.2 6.2 11 8l-1.8 1.8",
-      fitPage: "M3.5 2.5h9v11h-9zM5.5 8h5M6.8 6.4 5.5 8l1.3 1.6M8.2 6.4 9.5 8l-1.3 1.6",
       // Two chevrons, one outward and one inward: the outline's all / none.
       expandAll: "M4 6.5 8 2.5l4 4M4 9.5l4 4 4-4",
       collapseAll: "M4 2.5l4 4 4-4M4 13.5l4-4 4 4",
@@ -136,7 +144,6 @@ window.__ModuleLoader__.load({
       zoomIn: "放大",
       zoomOut: "缩小",
       fitWidth: "适应宽度",
-      fitPage: "整页显示",
       historyBack: "后退到上一个位置",
       historyForward: "前进到下一个位置",
       outline: "目录",
@@ -153,6 +160,12 @@ window.__ModuleLoader__.load({
       translate: "翻译",
       translating: "翻译中…",
       translateTimeout: "翻译等太久了，请重试",
+      ask: "问这段",
+      askLocation: "《{title}》第 {page} 页",
+      askUntitled: "这份文档",
+      askNoDocument: "还没有打开文档，先打开一个 PDF 再问",
+      askFailed: "没有找到可以插入的输入框，请先点一下对话框",
+
       copy: "复制",
       copied: "已复制",
       close: "关闭",
@@ -230,7 +243,6 @@ window.__ModuleLoader__.load({
       zoomIn: "Zoom in",
       zoomOut: "Zoom out",
       fitWidth: "Fit width",
-      fitPage: "Fit page",
       historyBack: "Back to the previous position",
       historyForward: "Forward to the next position",
       outline: "Outline",
@@ -245,6 +257,12 @@ window.__ModuleLoader__.load({
       translate: "Translate",
       translating: "Translating…",
       translateTimeout: "The translation took too long — try again",
+      ask: "Ask about this",
+      askLocation: "{title}, page {page}",
+      askUntitled: "this document",
+      askNoDocument: "No document is open yet — open a PDF before asking about it",
+      askFailed: "No composer was found to put it in — click the message box first",
+
       copy: "Copy",
       copied: "Copied",
       close: "Close",
@@ -415,6 +433,17 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Look a document up without disturbing the cache order.
+     * A render needs this to decide whether the very first paint should show the
+     * opening overlay at all.
+     * @param address - resource address.
+     * @returns the parked entry, or `undefined`.
+     */
+    function peekOpenDocument(address) {
+      return address === "" ? undefined : openDocuments.get(address);
+    }
+
+    /**
      * Take a document out of the cache without closing it.
      * The caller is about to re-attach the very same page container.
      * @param address - resource address.
@@ -445,6 +474,13 @@ window.__ModuleLoader__.load({
      * which is the only place the takeover order is visible from inside the app.
      */
     let previewRegistry = undefined;
+
+    /**
+     * The plugin context this half was applied with, kept for the helpers that
+     * run outside any hook: the selection bubble's 「问这段」 button needs the
+     * conversation service at press time, which is later than `apply`.
+     */
+    let pluginContext = undefined;
 
     /**
      * Tell the host half that this half is alive, and with what.
@@ -668,13 +704,19 @@ window.__ModuleLoader__.load({
       }
       const total = Number(response.headers.get("content-length") ?? 0);
       if (Number.isFinite(total) && total > MAX_PDF_BYTES) throw tooLarge(total);
+      // The Host judges "this file changed" by comparing the version its own
+      // metadata carries against the version the body says it is drawing. A
+      // body that could only report a constant always looked changed, so every
+      // metadata frame remounted it and the reader saw the whole file stream
+      // twice behind two progress bars. The route sends the token it stat'ed.
+      const version = response.headers.get("x-dsh-fast-pdf-version") || 1;
       // A transport that buffers the body has no stream to read from; the
       // bytes are then all here already and the progress line just ends.
       if (typeof response.body?.getReader !== "function") {
         const bytes = new Uint8Array(await response.arrayBuffer());
         if (bytes.length > MAX_PDF_BYTES) throw tooLarge(bytes.length);
         if (typeof onProgress === "function") onProgress(1, { loaded: bytes.length, total: bytes.length });
-        return { bytes, version: 1 };
+        return { bytes, version };
       }
       const reader = response.body.getReader();
       const parts = [];
@@ -711,7 +753,523 @@ window.__ModuleLoader__.load({
         at += part.length;
       }
       if (typeof onProgress === "function") onProgress(1, { loaded: read, total: total > 0 ? total : read });
-      return { bytes, version: 1 };
+      return { bytes, version };
+    }
+
+    /**
+     * Most pages one text upload carries.
+     *
+     * A chunk, not the document: the Host starts answering questions about the
+     * pages it already holds while the rest is still being extracted, and a
+     * single request for a 779-page manual would spend a megabyte on JSON
+     * escaping before the first tool call could run.
+     */
+    const SYNC_PAGES_PER_UPLOAD = 120;
+
+    /**
+     * Most characters one text upload carries.
+     *
+     * The page count alone is not a bound: a page of dense Chinese can hold ten
+     * times what a page of a scanned manual's OCR layer does. Whichever limit
+     * is reached first ends the chunk.
+     */
+    const SYNC_CHARS_PER_UPLOAD = 1_500_000;
+
+    /**
+     * How long the pane waits before polling again after a failed request.
+     *
+     * A Host that refused once is not going to accept the next poll a
+     * millisecond later, and a tight retry loop here would spin a core for as
+     * long as the failure lasts.
+     */
+    const WORK_RETRY_MS = 3000;
+
+    /**
+     * Shortest gap between two self-healing re-uploads of one document.
+     *
+     * The store lives in the Host's module state, so a plugin reload — or a Host
+     * restart — forgets every page that was uploaded, while the pane in the
+     * browser keeps its index and believes the upload finished. Neither side
+     * notices: the pane is past its cursor and the conversation is told there is
+     * no PDF. The poll the pane already makes is where that can be seen, and
+     * this is the floor on how often it may act on it — a Host that keeps
+     * answering "I never heard of that document" must not turn into a 559 KB
+     * upload every twenty seconds.
+     */
+    const RESYNC_COOLDOWN_MS = 60_000;
+
+    /**
+     * Fold a string to a short stable id.
+     *
+     * FNV-1a, because the value only has to be stable within one Host process
+     * and short enough to read in a tool call — it is an identity, not a
+     * security boundary.
+     * @param text - input.
+     * @returns seven base-36 digits.
+     */
+    function shortHash(text) {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      return hash.toString(36).padStart(7, "0");
+    }
+
+    /**
+     * The identifier a document is stored under on the Host.
+     *
+     * Address plus pdf.js's own fingerprint: the address names the file, and the
+     * fingerprint changes when the file's bytes do. Reopening the same document
+     * therefore lands on the text already uploaded, while an edited file becomes
+     * a separate document instead of inheriting page text that no longer
+     * matches it.
+     * @param address - the tab's file address.
+     * @param fingerprints - pdf.js document fingerprints, when available.
+     * @returns the docId.
+     */
+    function documentIdOf(address, fingerprints) {
+      const stamp = Array.isArray(fingerprints) ? fingerprints.join(",") : "";
+      return `d${shortHash(`${String(address)}\u0000${stamp}`)}`;
+    }
+
+    /**
+     * The file name at the end of a file address.
+     * @param address - `dsh-resource://file/session/...`.
+     * @returns the decoded last segment, or "".
+     */
+    function addressTitle(address) {
+      const text = String(address ?? "");
+      const cut = text.search(/[?#]/);
+      const parts = text.slice(0, cut === -1 ? undefined : cut).split("/");
+      const last = parts[parts.length - 1] ?? "";
+      try {
+        return decodeURIComponent(last);
+      } catch {
+        return last;
+      }
+    }
+
+    /**
+     * Look a service up the way a client plugin has to.
+     *
+     * `ctx.get` is the supported route and throws nothing when the service is
+     * absent; the property fallback covers a Host that exposes the service
+     * without registering it. Both are tried because the failure mode — a
+     * button that does nothing — is invisible from the pane.
+     * @param name - service name.
+     * @returns the service, or undefined.
+     */
+    function serviceOf(name) {
+      try {
+        const found = pluginContext?.get?.(name);
+        if (found !== undefined && found !== null) return found;
+      } catch {
+        /* fall through to the property */
+      }
+      return pluginContext?.[name];
+    }
+
+    /**
+     * Post one page-text chunk to the Host.
+     * @param sessionId - the session the document belongs to.
+     * @param payload - sync fields.
+     * @param signal - aborts the upload.
+     * @returns the Host's answer.
+     */
+    async function postSync(sessionId, payload, signal) {
+      const response = await fetch(assetUrl("sync", document.baseURI), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-dsh-fast-pdf": "sync" },
+        body: JSON.stringify({ sessionId, ...payload }),
+        signal,
+      });
+      if (response.ok !== true) {
+        // The status is kept on the error because the two failures want opposite
+        // answers: a 413 is the batch being too big — send less — while a 400 is
+        // this payload being unacceptable, and repeating it cannot change that.
+        const error = new Error(`the sync route answered ${String(response.status)}`);
+        error.status = Number(response.status);
+        throw error;
+      }
+      return response.json().catch(() => null);
+    }
+
+    /**
+     * Post one message on the pane's work channel.
+     * @param sessionId - the session the pane serves.
+     * @param payload - `{ action, jobId?, dataUrl? }`.
+     * @param signal - aborts the request; the poll relies on it being held open.
+     * @returns the Host's answer.
+     */
+    async function postWork(sessionId, payload, signal) {
+      const response = await fetch(assetUrl("work", document.baseURI), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-dsh-fast-pdf": "work" },
+        body: JSON.stringify({ sessionId, ...payload }),
+        signal,
+      });
+      if (response.ok !== true) throw new Error(`the work route answered ${String(response.status)}`);
+      return response.json().catch(() => null);
+    }
+
+    /**
+     * Tell the Host this pane is going away.
+     *
+     * Sent with `keepalive` and no signal: the page may be unloading, and a
+     * tool waiting for a page render must fail now rather than at its deadline.
+     * @param sessionId - the session the pane served.
+     */
+    function sayGoodbye(sessionId) {
+      try {
+        void fetch(assetUrl("work", document.baseURI), {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-dsh-fast-pdf": "work" },
+          body: JSON.stringify({ sessionId, action: "bye" }),
+          keepalive: true,
+        }).catch(() => {});
+      } catch {
+        /* the pane is going away; nothing to report to */
+      }
+    }
+
+    /**
+     * Put a passage into the conversation's composer.
+     *
+     * A quote node is the composer's own idea of "this text, from here", so it
+     * is tried first: the reader sees the passage as a quote above their
+     * cursor, exactly as if they had quoted the transcript. The plain-draft
+     * fallback covers a composer whose quote seat is closed (it refuses while a
+     * reply is streaming), where dropping the passage entirely would be worse
+     * than pasting it.
+     * @param sessionId - session whose composer receives the passage.
+     * @param text - the passage.
+     * @param where - line naming the document and page, or "".
+     * @returns whether the composer took it.
+     */
+    function askAboutSelection(sessionId, text, where) {
+      const conversation = serviceOf("conversation");
+      let shell;
+      try {
+        shell = conversation?.input?.shell?.(sessionId);
+      } catch {
+        shell = undefined;
+      }
+      if (shell === undefined || shell === null) return false;
+      const body = where === "" ? text : `${where}\n${text}`;
+      try {
+        if (typeof shell.insertQuote === "function" && shell.insertQuote(body) === true) {
+          shell.focus?.();
+          return true;
+        }
+      } catch {
+        /* the quote seat is closed or the editor refused; try plain text */
+      }
+      try {
+        if (typeof shell.setDraft !== "function") return false;
+        const state = shell.state?.getSnapshot?.();
+        const draft = typeof state?.draft === "string" ? state.draft : "";
+        const next = draft.trim() === "" ? `${body}\n\n` : `${draft.trimEnd()}\n\n${body}\n\n`;
+        shell.setDraft(next);
+        shell.focus?.();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Upload one document's page text to the Host as it becomes available.
+     *
+     * Driven by the viewer's own progress rather than by a timer that guesses:
+     * `indexText()` pushes pages in order, so what has been extracted is exactly
+     * `pageTexts[0 .. indexedPages)`. Everything past the high-water mark is
+     * sent in chunks, which is why a question about chapter one can be answered
+     * while page 700 is still being scanned.
+     *
+     * Only `text` travels. The renderer's index also carries a normalized-to-raw
+     * offset map for highlighting, which is four bytes per character and belongs
+     * to the pane that draws the highlights; the Host only needs to find a page.
+     * @param options - `{ address, sessionId, viewer, outline, signal }`.
+     * @returns `{ docId, nudge, stop }`.
+     */
+    function startTextSync({ address, sessionId, viewer, outline, signal }) {
+      const pages = () => (Array.isArray(viewer.pageTexts) ? viewer.pageTexts : []);
+      const docId = documentIdOf(address, viewer.pdf?.fingerprints);
+      // The address, not `viewer.name`: the viewer is opened with bytes and no
+      // name, so it falls back to the localized word "文档" — which is what the
+      // conversation would then call every document. The address always ends in
+      // the file's own name, and that is what a person recognises in a citation.
+      const title = addressTitle(address) || String(viewer.name ?? "");
+      const pageCount = Number(viewer.pageCount) || 0;
+      /** Pages below this have been handed to the Host already. */
+      let sent = 0;
+      let outlineSent = false;
+      let complete = false;
+      let busy = false;
+      let stopped = false;
+      let timer = 0;
+      /** Set when the Host refused the payload itself, so retrying is pointless. */
+      let giveUp = false;
+
+      /**
+       * Send whatever is newly extracted, then the outline, then `complete`.
+       *
+       * `sent` advances only after a batch has been acknowledged. Building the
+       * batch and moving the cursor in the same loop would be one line shorter
+       * and wrong: a batch that fails to upload would leave its pages behind
+       * `sent`, and since nothing ever asks for them again they would be missing
+       * from the Host for the life of the document — silently, because the
+       * document would still look complete.
+       */
+      const flush = async () => {
+        if (busy || stopped) return;
+        busy = true;
+        try {
+          for (;;) {
+            if (stopped) break;
+            const all = pages();
+            if (sent >= all.length) break;
+            const batch = [];
+            let chars = 0;
+            let cursor = sent;
+            while (
+              cursor < all.length
+              && batch.length < SYNC_PAGES_PER_UPLOAD
+              && (batch.length === 0 || chars < SYNC_CHARS_PER_UPLOAD)
+            ) {
+              const page = all[cursor];
+              const text = typeof page?.text === "string" ? page.text : "";
+              batch.push({ pageNumber: cursor + 1, text });
+              chars += text.length;
+              cursor += 1;
+            }
+            const rows = outline?.();
+            const withOutline = !outlineSent && Array.isArray(rows) && rows.length > 0;
+            await postSync(sessionId, {
+              docId,
+              title,
+              address: String(address),
+              pageCount,
+              pages: batch,
+              ...(withOutline ? { outline: rows } : {}),
+              complete: false,
+            }, signal);
+            // Acknowledged, so the pages may be forgotten here. The outline
+            // rides along with whichever batch was in flight, so it is marked
+            // sent only once that batch landed too.
+            sent = cursor;
+            if (withOutline) outlineSent = true;
+            beacon("serve-sent", { docId, sent, outline: withOutline });
+          }
+          const done = complete || (pageCount > 0 && sent >= pageCount);
+          if (done && (!complete || !outlineSent)) {
+            const rows = outline?.();
+            const withOutline = !outlineSent && Array.isArray(rows) && rows.length > 0;
+            if (withOutline) outlineSent = true;
+            complete = true;
+            await postSync(sessionId, {
+              docId,
+              title,
+              address: String(address),
+              pageCount,
+              ...(withOutline ? { outline: rows } : {}),
+              complete: true,
+            }, signal);
+          }
+        } catch (error) {
+          // A failed chunk is not fatal: `sent` still points at the first page
+          // the Host never acknowledged, so the next nudge retries from exactly
+          // there. What must not happen is the failure going unrecorded — a
+          // document that uploads nothing and a document that is fully indexed
+          // look identical from the conversation's side.
+          if (signal?.aborted !== true) {
+            // 400 and 403 are verdicts, not accidents: the payload is wrong or
+            // this request is not allowed, and repeating it every three seconds
+            // would retry a permanently refused upload until the pane closes.
+            // Everything else — a Host restarting, a dropped connection, a 413
+            // from a batch that is too big to be worth retrying as-is — is worth
+            // another try.
+            const status = Number(error?.status);
+            giveUp = status === 400 || status === 403;
+            beacon("sync-fail", { message: String(error?.message ?? error).slice(0, 160), status });
+          }
+        } finally {
+          busy = false;
+        }
+      };
+
+      /** Retry after a pause, so a Host that is restarting is not hammered. */
+      const schedule = () => {
+        if (stopped || giveUp) return;
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          timer = 0;
+          void flush();
+        }, WORK_RETRY_MS);
+      };
+
+      const nudge = () => {
+        if (stopped || giveUp) return;
+        clearTimeout(timer);
+        timer = 0;
+        void flush().then(() => {
+          // Nothing left to send and the document is fully indexed: stop.
+          if (stopped) return;
+          if (complete && sent >= pages().length) return;
+          schedule();
+        });
+      };
+
+      /**
+       * Send the table of contents once it is known.
+       *
+       * Called when the outline arrives, which is after the first text chunk on
+       * a big document: waiting for it would delay the text, and the outline is
+       * the cheap first thing a model asks for.
+       */
+      const pushOutline = () => {
+        if (stopped || giveUp || outlineSent) return;
+        const rows = outline?.();
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        outlineSent = true;
+        void postSync(sessionId, {
+          docId,
+          title,
+          address: String(address),
+          pageCount,
+          outline: rows,
+          complete: false,
+        }, signal).catch(() => {});
+      };
+
+      /**
+       * Send the whole document again because the Host has forgotten it.
+       *
+       * Every page is still in this pane's index — the Host is the one that
+       * lost them — so the repair is to move the cursor back to the start and
+       * flush. `complete` goes back to false too: a closing word for a document
+       * the Host no longer holds is refused as a payload error, and that verdict
+       * would set `giveUp` and freeze the upload for good.
+       *
+       * Rate-limited rather than firing on every poll: the pane polls once per
+       * held-open request, so a Host that answered "unknown" every time would
+       * otherwise re-send 559 KB in a loop.
+       * @returns true when a re-upload was started.
+       */
+      let resyncedAt = 0;
+      const resync = () => {
+        if (stopped || signal?.aborted === true) return false;
+        // Nothing has ever been acknowledged, so "the Host does not know this
+        // document" describes the first moments after opening it, not a loss.
+        // Acting on that would race the upload already in flight and send every
+        // page twice.
+        if (sent === 0) return false;
+        const now = Date.now();
+        if (resyncedAt !== 0 && now - resyncedAt < RESYNC_COOLDOWN_MS) return false;
+        if (pages().length === 0) return false;
+        resyncedAt = now;
+        sent = 0;
+        outlineSent = false;
+        complete = false;
+        giveUp = false;
+        beacon("serve-resync", { docId, pages: pages().length });
+        nudge();
+        return true;
+      };
+
+      // `session` rides along on purpose: when the pane uploaded 779 pages and
+      // the conversation could not see them, the one fact that explains it is
+      // which session they were filed under, and nothing recorded that.
+      beacon("serve-start", { docId, session: sessionId, pages: pages().length, pageCount });
+      void flush();
+      return {
+        docId,
+        nudge,
+        pushOutline,
+        resync,
+        stop: () => {
+          stopped = true;
+          clearTimeout(timer);
+        },
+      };
+    }
+
+    /**
+     * Serve the Host's page-render requests for as long as the pane is open.
+     *
+     * One request is held open at a time: the Host answers it with a job when a
+     * tool needs a page, and with `null` after a timeout when there is nothing
+     * to do. That is a plain request/response and therefore works over both
+     * transports — the desktop shell carries it over an IPC bridge that does not
+     * forward a WebSocket upgrade.
+     * @param options - `{ sessionId, viewer, docId, signal }`.
+     * @returns `{ stop }`.
+     */
+    function startWorkLoop({ sessionId, viewer, docId, signal, onForgotten }) {
+      let stopped = false;
+      let retry = 0;
+      let current = null;
+
+      const wait = () => new Promise((resolve) => {
+        retry = setTimeout(resolve, WORK_RETRY_MS);
+        retry.unref?.();
+      });
+
+      const serve = async (job) => {
+        let answer;
+        try {
+          if (typeof job?.docId === "string" && job.docId !== "" && job.docId !== docId) {
+            answer = { action: "fail", jobId: job.id, reason: "the open pane is showing a different document; open the one the question is about" };
+          } else {
+            const dataUrl = await viewer.getPageImage(Number(job.pageNumber), signal);
+            if (stopped || signal?.aborted === true) return;
+            answer = typeof dataUrl === "string" && dataUrl.startsWith("data:image/")
+              ? { action: "deliver", jobId: job.id, dataUrl }
+              : { action: "fail", jobId: job.id, reason: "the page could not be rendered" };
+          }
+        } catch (error) {
+          if (stopped || signal?.aborted === true) return;
+          answer = { action: "fail", jobId: job.id, reason: String(error?.message ?? error).slice(0, 200) };
+        }
+        try {
+          await postWork(sessionId, answer, signal);
+        } catch {
+          // The tool's own deadline covers a lost answer; polling again is what
+          // this loop does anyway.
+        }
+      };
+
+      const loop = async () => {
+        while (!stopped && signal?.aborted !== true) {
+          try {
+            const answer = await postWork(sessionId, { action: "poll", docId }, signal);
+            if (stopped || signal?.aborted === true) return;
+            // The Host answers `known: false` when it has no entry for this
+            // document — it restarted, or the plugin was reloaded under it.
+            // The pages are here in the pane, so the repair is to send them
+            // again; without this the document stayed invisible for the life of
+            // the tab, which is how 779 uploaded pages disappeared.
+            if (answer?.known === false) onForgotten?.();
+            const job = answer?.job;
+            if (job === null || job === undefined) continue;
+            await serve(job);
+          } catch {
+            if (stopped || signal?.aborted === true) return;
+            beacon("work-fail", {});
+            await wait();
+          }
+        }
+      };
+
+      const pending = loop();
+      return {
+        stop: () => {
+          stopped = true;
+          clearTimeout(retry);
+          void pending.catch(() => {});
+        },
+      };
     }
 
     /** Inject the renderer's stylesheet rules once per page. */
@@ -1031,7 +1589,48 @@ window.__ModuleLoader__.load({
       const frameRef = React.useRef(null);
       const pagesRef = React.useRef(null);
       const viewerRef = React.useRef(null);
-      const [status, setStatus] = React.useState("loading");
+      // A document that is still open is re-attached from the cache, not read
+      // again — but the first paint used to say "loading" regardless, so a
+      // switch back showed the opening overlay for the ~200 ms the re-attach
+      // takes, with no byte count to put in it and therefore the sweeping
+      // indeterminate bar instead of a 0-100 one. Ask the cache before the
+      // first paint, not after. The rebuild path sets "loading" itself if it
+      // decides the cached row is stale (a new viewer build, different bytes).
+      const cachedRow = peekOpenDocument(String(props.resourceAddress ?? ""));
+      const [status, setStatus] = React.useState(
+        cachedRow !== undefined && cachedRow.bytes !== undefined ? "ready" : "loading",
+      );
+      /**
+       * Put a cached document's pages back before the first paint.
+       *
+       * The re-attach itself lives in a passive effect, because it needs the
+       * bytes in state first — and a passive effect runs after the browser has
+       * already painted. Between the two the frame is on screen with no
+       * children at all, so the reader sees the frame's own background: that
+       * is the black flash on a switch back (「黑着 0.几秒」). Painting a
+       * progress bar over it would be covering a hole that does not need to be
+       * there — the parked container is already in hand at render time, so it
+       * can go back in the layout pass, before that paint happens.
+       *
+       * Cheap and idempotent: appending a node that is already the frame's
+       * child is a no-op, and a row the rebuild path rejects is removed from
+       * the DOM by `closeOpenDocument` anyway.
+       */
+      // Same three conditions the build effect uses to accept a cached row, so
+      // this fast path can never show a container that effect is about to throw
+      // away: it has pages, it has the bytes, and it was made by this build.
+      const cachedPages = cachedRow !== undefined
+        && cachedRow.pages !== undefined
+        && cachedRow.bytes !== undefined
+        && cachedRow.moduleRevision === moduleRevision
+        ? cachedRow.pages
+        : undefined;
+      React.useLayoutEffect(() => {
+        const frame = frameRef.current;
+        if (frame === null || cachedPages === undefined) return;
+        if (cachedPages.parentNode === frame) return;
+        frame.appendChild(cachedPages);
+      }, [cachedPages]);
       const [failure, setFailure] = React.useState("");
       const [attempt, setAttempt] = React.useState(0);
       const [view, setView] = React.useState({ page: 1, total: 0, scale: 1, mode: "page-width" });
@@ -1084,7 +1683,7 @@ window.__ModuleLoader__.load({
       // first time it is asked for.
       const [sheet, setSheet] = React.useState(null);
       const [settingsOpen, setSettingsOpen] = React.useState(false);
-      const [preferences, setPreferences] = React.useState({ translationLanguage: "auto", defaultZoom: "page-fit", pageGap: 14 });
+      const [preferences, setPreferences] = React.useState({ translationLanguage: "auto", defaultZoom: "page-width", pageGap: 14 });
       const preferencesRef = React.useRef(preferences);
       preferencesRef.current = preferences;
       /** Whether the stored preferences have been adopted into React state once. */
@@ -1313,7 +1912,7 @@ window.__ModuleLoader__.load({
           const next = {
             page: viewer.currentPage ?? previous.page,
             total: viewer.pageCount ?? previous.total,
-            scale: viewer.pinch?.target ?? viewer.zoom ?? previous.scale,
+            scale: viewer.pinch?.target ?? viewer.resize?.target ?? viewer.zoom ?? previous.scale,
             mode: viewer.zoomMode ?? previous.mode,
             back: viewer.history?.canBack?.() === true,
             forward: viewer.history?.canForward?.() === true,
@@ -1681,6 +2280,42 @@ window.__ModuleLoader__.load({
           clearTimeout(timer);
           if (pickAbort.current === controller) pickAbort.current = null;
         }
+      }, []);
+
+      /**
+       * Ask the conversation about the selection instead of translating it.
+       *
+       * The text goes into the composer, not into a request of our own: the
+       * answer is meant to come from the conversation the reader is already in,
+       * where the document tools can be called and the reply keeps its context.
+       * The line above the text names the document and the page, because the
+       * tools address a document by id — the reader's own eyes are what says
+       * which page a passage came from.
+       *
+       * Landing in the composer can fail for a reason that is not an error: the
+       * core refuses quote insertion while a reply is streaming. Falling back to
+       * plain text keeps the button useful there, and only a composer that
+       * refuses both gets told so.
+       */
+      const ask = React.useCallback((held) => {
+        const current = held ?? null;
+        if (current === null) return;
+        const viewer = viewerRef.current;
+        setChip(null);
+        if (viewer === null) {
+          setPick({ ...current, text: "", status: "error", message: String(copy.current("askNoDocument")) });
+          return;
+        }
+        const sessionId = String(sessionRef.current ?? "");
+        const page = Number(current.pageNumber) || 0;
+        const title = String(viewer.name ?? "").trim();
+        const where = page > 0
+          ? String(copy.current("askLocation"))
+            .replace("{title}", title === "" ? String(copy.current("askUntitled")) : title)
+            .replace("{page}", String(page))
+          : "";
+        if (sessionId !== "" && askAboutSelection(sessionId, current.text, where)) return;
+        setPick({ ...current, text: "", status: "error", message: String(copy.current("askFailed")) });
       }, []);
 
       /** Stop the call in flight and put the card away. */
@@ -2130,12 +2765,20 @@ window.__ModuleLoader__.load({
             });
             return;
           }
+          // Which page this came from, for the line 「问这段」 puts in front of
+          // it. Read from the DOM rather than from the selection: pdf.js marks
+          // every page box with its own number, and the range's ancestor is the
+          // only thing that knows which box the reader dragged across.
+          const pageBox = (range.startContainer instanceof Element
+            ? range.startContainer
+            : range.startContainer.parentElement)?.closest?.("[data-page-number]");
+          const pageNumber = Number(pageBox?.dataset?.pageNumber) || 0;
           // A pinned card stays exactly where it is — that is what pinning it
           // bought — but a longer read still goes on around it, and a new
           // selection still gets its own 翻译. The pill is offered as usual, and
           // pressing it fills that same card in place. Suppressing the pill
           // instead is how 「固定之后划词不再弹翻译」 happened.
-          setChip({ text: prepared.text, mode: prepared.mode, ...anchored });
+          setChip({ text: prepared.text, mode: prepared.mode, pageNumber, ...anchored });
         };
         // A drag inside the page ends on mouseup, and the selection is read in
         // that same task: the text layer is emptied and rebuilt at the end of
@@ -2310,6 +2953,59 @@ window.__ModuleLoader__.load({
         /** The cache row this effect owns, once there is something worth keeping. */
         let entry = null;
         const address = sourceAddress;
+        /**
+         * The two background jobs this pane runs for the conversation: uploading
+         * page text, and rendering pages the Host asks for. Both stop with the
+         * mount.
+         */
+        let serving = null;
+        const servingAbort = new AbortController();
+        /**
+         * Start serving the conversation from this viewer.
+         *
+         * Called once per attached viewer. Page text goes up first and the
+         * render seam comes second, so a question about text is answerable even
+         * if the very next thing the reader does is close the pane.
+         * @param target - the attached viewer.
+         */
+        const startServing = (target) => {
+          if (serving !== null) return;
+          const sessionId = String(sessionRef.current ?? "");
+          // Both of these were silent returns, and a pane that uploaded nothing
+          // looked exactly like a pane with nothing to upload: the conversation
+          // said "no PDF has been read" while a 37 MB manual was open on screen,
+          // and there was no way to tell which of the two inputs was missing.
+          // This is the only place that knows, so it says so.
+          if (sessionId === "" || address === "") {
+            beacon("serve-skip", { session: sessionId === "" ? "missing" : "ok", address: address === "" ? "missing" : "ok" });
+            return;
+          }
+          const text = startTextSync({
+            address,
+            sessionId,
+            viewer: target,
+            outline: () => outlineRef.current,
+            signal: servingAbort.signal,
+          });
+          const work = startWorkLoop({
+            sessionId,
+            viewer: target,
+            docId: text.docId,
+            signal: servingAbort.signal,
+            // The poll is the only channel that travels from the Host to this
+            // pane, so it is also the only place the Host can say "I no longer
+            // have that document". The pages are here; send them again.
+            onForgotten: () => text.resync(),
+          });
+          serving = {
+            nudge: text.nudge,
+            pushOutline: text.pushOutline,
+            stop: () => {
+              text.stop();
+              work.stop();
+            },
+          };
+        };
         const attachScrollDiagnostics = async (target, module, listenerExists = false) => {
           const previousScroll = target.onScroll;
           if (listenerExists) frame.removeEventListener("scroll", previousScroll);
@@ -2382,6 +3078,7 @@ window.__ModuleLoader__.load({
                   }));
                   setOutline(enriched);
                   if (entry !== null) entry.rows = enriched;
+                  serving?.pushOutline();
                   sync();
                 }, () => {});
             })
@@ -2401,8 +3098,12 @@ window.__ModuleLoader__.load({
               scheduled = 0;
               const current = viewerRef.current;
               if (current === null || disposed || current.pinch) return;
-              if (current.zoomMode !== "page-width" && current.zoomMode !== "page-fit") return;
-              current.setZoom(current.zoomMode, { silent: true });
+              if (current.zoomMode !== "page-width") return;
+              // A drag changes the width on every frame. The viewer shows that
+              // as a compositor transform and lays the document out once the
+              // width settles; only a viewport that cannot preview (no pages
+              // yet) falls back to the full commit here.
+              if (!current.previewResize()) current.setZoom(current.zoomMode, { silent: true });
               sync();
             });
           });
@@ -2458,6 +3159,10 @@ window.__ModuleLoader__.load({
             placeTimer.current = setTimeout(savePlace, PLACE_DEBOUNCE_MS);
           };
           viewer.onIndex = () => {
+            // The upload comes first and unconditionally: the search bar's early
+            // return is about the reader's query, not about whether the
+            // conversation can see these pages.
+            serving?.nudge();
             if (findRef.current.query === "") return;
             clearTimeout(findTimer.current);
             findTimer.current = setTimeout(() => void refreshFind(), FIND_DEBOUNCE_MS);
@@ -2497,6 +3202,7 @@ window.__ModuleLoader__.load({
           }
           setOutline(parked.rows ?? null);
           setStatus("ready");
+          startServing(viewer);
           sync();
           watchWidth();
           void loadViewer().then((module) => {
@@ -2508,6 +3214,15 @@ window.__ModuleLoader__.load({
           if (findRef.current.query !== "") void runFind(findRef.current.query, 0, false);
           return () => {
             disposed = true;
+            if (serving !== null) {
+              serving.stop();
+              serving = null;
+              // Tell the Host this pane is gone before the request is dropped:
+              // a tool waiting for a page render must fail now, not at its
+              // deadline, and `keepalive` lets the message outlive the unmount.
+              sayGoodbye(String(sessionRef.current ?? ""));
+            }
+            servingAbort.abort();
             clearTimeout(findTimer.current);
             clearTimeout(placeTimer.current);
             savePlace();
@@ -2583,6 +3298,7 @@ window.__ModuleLoader__.load({
             // The background index reports progress; a live query catches up
             // with it instead of waiting for the last page.
             onIndex: () => {
+              serving?.nudge();
               if (findRef.current.query === "") return;
               clearTimeout(findTimer.current);
               findTimer.current = setTimeout(() => void refreshFind(), FIND_DEBOUNCE_MS);
@@ -2677,6 +3393,7 @@ window.__ModuleLoader__.load({
             viewer.setZoom(savedPreferences.defaultZoom, { silent: true });
           }
           finishOpenProgress();
+          startServing(viewer);
           sync();
           // From here on this viewer is worth keeping: a switch away parks it
           // (see `park`), and a switch back re-attaches it.
@@ -2801,10 +3518,23 @@ window.__ModuleLoader__.load({
         sync();
       };
 
-      const setFit = (mode) => {
+      /**
+       * Turn 适应宽度 on, or off again.
+       *
+       * On: the page follows the pane's width, now and after every drag. Off:
+       * the page keeps the size it has this instant and stops following, which
+       * is the same state the + and − buttons put it in. Pressing a lit mode
+       * button to leave the mode is what the find bar's two switches already
+       * do, so a reader who has used those knows this one.
+       */
+      const fitWidth = () => {
         const current = viewer();
         if (current === null) return;
-        current.setZoom(mode);
+        if (current.zoomMode === "page-width") {
+          current.setZoom(String(Math.round(current.zoom * 100)));
+        } else {
+          current.setZoom("page-width");
+        }
         sync();
       };
 
@@ -3097,10 +3827,20 @@ window.__ModuleLoader__.load({
           React.createElement(
             Button,
             {
-              label: view.mode === "page-width" ? t("fitPage") : t("fitWidth"),
+              // One mode, one meaning: widen the page until its text is as
+              // large as the pane allows. It was a two-way toggle — the label
+              // named the mode you would get, the icon named the one you were
+              // in — and reading both at once was the confusing part.
+              //
+              // It is still a *mode*, not a one-shot action: while it is on,
+              // dragging the split resizes the page to keep filling the width.
+              // Lighting the button is what says so — without it, that live
+              // resizing reads as the button having worn off.
+              label: t("fitWidth"),
+              pressed: view.mode === "page-width",
               disabled: status !== "ready",
-              onClick: () => setFit(view.mode === "page-width" ? "page-fit" : "page-width"),
-              icon: icon(null, view.mode === "page-width" ? DRAWN.fitWidth : DRAWN.fitPage),
+              onClick: fitWidth,
+              icon: icon(null, DRAWN.fitWidth),
             },
           ),
         ),
@@ -3447,6 +4187,11 @@ window.__ModuleLoader__.load({
       // The pill offers the request; the card is the request. Two elements, two
       // lifetimes: a pinned card can be on screen while the next selection's
       // pill waits beside it.
+      //
+      // Two offers share the pill: 翻译 answers in place, 问这段 hands the text
+      // to the conversation. They are the same gesture on the same selection,
+      // so they belong in one pill rather than in a menu the reader has to open
+      // after already deciding what they want to ask about.
       const pickChip = chip === null
         ? null
         : React.createElement(
@@ -3463,6 +4208,11 @@ window.__ModuleLoader__.load({
             "button",
             { type: "button", className: "fp-pick-action", onClick: () => void translate(chip) },
             t("translate"),
+          ),
+          React.createElement(
+            "button",
+            { type: "button", className: "fp-pick-action", onClick: () => ask(chip) },
+            t("ask"),
           ),
         );
 
@@ -3834,7 +4584,7 @@ window.__ModuleLoader__.load({
                   value: preferences.defaultZoom,
                   onChange: (event) => void updatePreference("defaultZoom", event.target.value),
                 },
-                ...[["page-fit", t("fitPage")], ["page-width", t("fitWidth")], ["50", "50%"], ["75", "75%"], ["100", "100%"], ["125", "125%"], ["150", "150%"], ["175", "175%"], ["200", "200%"], ["250", "250%"], ["300", "300%"]]
+                ...[["page-width", t("fitWidth")], ["50", "50%"], ["75", "75%"], ["100", "100%"], ["125", "125%"], ["150", "150%"], ["175", "175%"], ["200", "200%"], ["250", "250%"], ["300", "300%"]]
                   .map(([value, label]) => React.createElement("option", { key: value, value }, label)),
               ),
               React.createElement("span", { className: "fp-settings-hint" }, t("defaultZoomHint")),
@@ -4069,6 +4819,10 @@ window.__ModuleLoader__.load({
       const startedAt = Date.now();
       moduleRevision = `${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       viewerModule = undefined;
+      // Kept for code that runs outside a React effect — the pill's 「问这段」
+      // runs in an event handler, where there is no `ctx` in scope and the
+      // conversation service has to be looked up on the spot.
+      pluginContext = ctx;
       helperModules.clear();
       const t = ctx.locale.bind(NS);
       const tabs = retainTabs();

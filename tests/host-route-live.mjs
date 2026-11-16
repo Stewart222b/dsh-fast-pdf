@@ -413,6 +413,24 @@ if (plan !== -1) {
       );
       assert.equal(served.length, wanted.length);
       assert.equal(Buffer.compare(Buffer.from(served), wanted), 0, "the file comes back byte for byte");
+
+      // The token the body echoes back as "the version I am drawing". The Host
+      // compares it against its own metadata and remounts the body when they
+      // differ, which is what showed the reader a second progress bar; a body
+      // that could only report a constant never matched. Whatever the exact
+      // numbers, the shape is the Host's `dev:ino:size:mtimeNs:ctimeNs`.
+      const version = answer.headers.get("x-dsh-fast-pdf-version");
+      assert.match(
+        String(version),
+        /^\d+:\d+:\d+:\d+:\d+$/u,
+        "the route reports the file version the body has to echo back",
+      );
+      const sampled = await stat(sample, { bigint: true });
+      assert.equal(
+        version,
+        `${sampled.dev}:${sampled.ino}:${sampled.size}:${sampled.mtimeNs}:${sampled.ctimeNs}`,
+        "and it is the same token the Host's own filesystem layer builds",
+      );
     });
 
     await check("a session address resolves against that session's workspace root", async () => {

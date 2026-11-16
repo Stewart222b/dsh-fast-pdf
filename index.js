@@ -30,6 +30,10 @@ import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INPUT, translateSelection, translateSelectionStream } from "./translate.js";
+import { documentsForSession, resolveDocument, writeDocument } from "./documents.js";
+import { deliverImage, failImage, releaseSession, takeWork } from "./bridge.js";
+import { readBodyWithin } from "./http-body.js";
+import { createTools } from "./tools.js";
 
 export const name = "fast-pdf";
 
@@ -66,6 +70,49 @@ const FILE_PATH = `${ROUTE_PREFIX}/file`;
 
 /** Marker the file route requires. */
 const FILE_HEADER = "x-dsh-fast-pdf";
+
+/**
+ * Response header carrying the file's version token.
+ *
+ * Same shape the Host's own filesystem layer builds from `dev:ino:size:mtimeNs`
+ * `:ctimeNs`. The body echoes it back to the Host as the version it is drawing,
+ * so a metadata refresh that reports the same token is judged "no change" and
+ * does not remount the body behind a second progress bar.
+ */
+const FILE_VERSION_HEADER = "x-dsh-fast-pdf-version";
+
+/**
+ * Exact route the browser half uploads extracted text to.
+ *
+ * The document tools read what this route stored, so a question about a page
+ * still has an answer after the reader closes the pane, switches tabs or
+ * reloads. That is the whole reason the text crosses to the Host at all: a tool
+ * call cannot ask a renderer for anything, and the conversation outlives the
+ * pane.
+ */
+const SYNC_PATH = `${ROUTE_PREFIX}/sync`;
+
+/**
+ * Exact route a pane polls when it is willing to render a page.
+ *
+ * Ordinary request/response, deliberately: the desktop shell carries this
+ * traffic over an IPC bridge and does not necessarily forward a WebSocket
+ * upgrade, so the Host-to-browser direction is inverted rather than pushed.
+ */
+const WORK_PATH = `${ROUTE_PREFIX}/work`;
+
+/** Marker the sync and work routes require. */
+const SYNC_HEADER = "x-dsh-fast-pdf";
+
+/**
+ * Largest sync upload accepted, in bytes.
+ *
+ * One chunk of page texts, not the whole manual: the browser sends a few hundred
+ * pages at a time, and this ceiling is what a chunk of a very dense document
+ * needs. It is separate from `MAX_BODY` because translation input and page text
+ * are not the same kind of payload and must not be forced to share a limit.
+ */
+const MAX_SYNC_BODY = 8 * 1024 * 1024;
 
 /**
  * Largest file the route will stream.
@@ -268,36 +315,12 @@ async function handler(req, res) {
 }
 
 /**
- * Read a request body as text, refusing anything oversized.
- *
- * On an oversized or broken upload the rest of the stream has to be consumed
- * before replying: an unread body left on a keep-alive socket is parsed as the
- * next request's start line. The loop drains it to the end while dropping the
- * chunks, so memory stays bounded.
+ * Read a translation request body as text, refusing anything oversized.
  * @param req - HTTP request.
  * @returns the body, or `undefined` when it is too large or unreadable.
  */
 async function readBody(req) {
-  const chunks = [];
-  let size = 0;
-  let tooLarge = false;
-  try {
-    for await (const chunk of req) {
-      size += chunk.length;
-      if (size > MAX_BODY) {
-        // Keep draining to the end instead of replying early: an unread body
-        // on a keep-alive socket is parsed as the next request's start line.
-        // Dropping the chunks here keeps memory bounded all the same.
-        tooLarge = true;
-        chunks.length = 0;
-        continue;
-      }
-      if (!tooLarge) chunks.push(chunk);
-    }
-  } catch {
-    return undefined;
-  }
-  return tooLarge ? undefined : Buffer.concat(chunks).toString("utf8");
+  return readBodyWithin(req, MAX_BODY);
 }
 
 /**
@@ -623,6 +646,21 @@ async function fileHandler(ctx, req, res) {
     reply(413, { ok: false, code: "too-large", size: info.size });
     return;
   }
+  // The body reports this token back to the Host as "the version of the file it
+  // is drawing", and the Host compares it with the version its own metadata
+  // carries: a difference means the file changed, which makes it drop the body
+  // and mount it again — a second full read behind a second progress bar. A
+  // body with no way to learn the token could only report a constant, and a
+  // constant never equals `dev:ino:size:mtimeNs:ctimeNs`, so every metadata
+  // frame looked like a change. `bigint` is what carries the nanoseconds; the
+  // plain stat above has them rounded to `mtimeMs`, which is not the same token.
+  let version = "";
+  try {
+    const ns = await stat(wanted, { bigint: true });
+    version = `${ns.dev}:${ns.ino}:${ns.size}:${ns.mtimeNs}:${ns.ctimeNs}`;
+  } catch {
+    /* Without it the body falls back to its old constant; reading still works. */
+  }
   // `no-store`: the pane asks again whenever the Host says the file changed, and
   // a cached copy would quietly show the old bytes.
   res.writeHead(200, {
@@ -630,6 +668,11 @@ async function fileHandler(ctx, req, res) {
     "content-length": String(info.size),
     "cache-control": "no-store",
     "access-control-allow-origin": "*",
+    // A custom response header is invisible to `response.headers.get()` on a
+    // cross-origin read, and the body would fall back to its old constant —
+    // silently restoring the double load this header exists to stop.
+    "access-control-expose-headers": FILE_VERSION_HEADER,
+    ...version === "" ? {} : { [FILE_VERSION_HEADER]: version },
   });
   if (info.size === 0) {
     res.end();
@@ -638,6 +681,179 @@ async function fileHandler(ctx, req, res) {
   const stream = createReadStream(wanted);
   stream.on("error", () => res.destroy());
   stream.pipe(res);
+}
+
+/**
+ * Answer one session identifier, rejecting anything that is not one.
+ *
+ * The browser learns the id from its own pane and sends it back; the Host trusts
+ * the value no further than "a key into its own tables". Refusing empty and
+ * non-string values here keeps every route from having to repeat the check.
+ * @param value - candidate session id.
+ * @returns the id, or undefined.
+ */
+function sessionIdOf(value) {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/**
+ * Answer one text upload from an open pane.
+ *
+ * The browser half sends the pages it has extracted so far, in chunks, and gets
+ * back what the Host now holds. `docId` is minted by the browser from the
+ * document's address and modification time, so reopening the same file reuses
+ * one entry and an edited file becomes a different document — the tools never
+ * answer from text that belongs to a file the user has since changed.
+ * @param req - HTTP request.
+ * @param res - HTTP response.
+ */
+async function syncHandler(req, res) {
+  /** @param status - HTTP status. @param body - JSON-ready payload. */
+  const reply = (status, body) => {
+    const payload = Buffer.from(JSON.stringify(body), "utf8");
+    res.writeHead(status, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(payload.length),
+      "cache-control": "no-store",
+    });
+    res.end(payload);
+  };
+  if (req.method !== "POST") {
+    res.writeHead(405, { allow: "POST" });
+    res.end();
+    return;
+  }
+  if (req.headers[SYNC_HEADER] !== "sync" || req.headers["sec-fetch-site"] === "cross-site") {
+    res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+    res.end("forbidden");
+    return;
+  }
+  const body = await readBodyWithin(req, MAX_SYNC_BODY);
+  if (body === undefined) {
+    reply(413, { ok: false, code: "too-large", message: "请求太大" });
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    reply(400, { ok: false, code: "body", message: "请求不是合法的 JSON" });
+    return;
+  }
+  const sessionId = sessionIdOf(payload?.sessionId);
+  if (sessionId === undefined) {
+    reply(400, { ok: false, code: "session", message: "需要一个会话" });
+    return;
+  }
+  const entry = writeDocument({
+    sessionId,
+    docId: payload?.docId,
+    title: payload?.title,
+    address: payload?.address,
+    pageCount: payload?.pageCount,
+    pages: payload?.pages,
+    outline: payload?.outline,
+    complete: payload?.complete === true,
+  });
+  if (entry === undefined) {
+    reply(400, { ok: false, code: "body", message: "请求里没有可用的页面文本" });
+    return;
+  }
+  const documents = documentsForSession(sessionId).map((document) => ({
+    docId: document.docId,
+    title: document.title,
+    pageCount: document.pageCount,
+    complete: document.complete === true,
+  }));
+  reply(200, { ok: true, docId: entry.docId, documents });
+}
+
+/**
+ * Answer one "do you need anything?" poll from an open pane.
+ *
+ * Held open for a few seconds rather than answered immediately, so a tool call
+ * that starts while the pane is idle still finds it. `null` means "nothing to
+ * do, ask again"; a job means "render this page and post it back".
+ * @param req - HTTP request.
+ * @param res - HTTP response.
+ */
+async function workHandler(req, res) {
+  if (req.method !== "POST") {
+    res.writeHead(405, { allow: "POST" });
+    res.end();
+    return;
+  }
+  if (req.headers[SYNC_HEADER] !== "work" || req.headers["sec-fetch-site"] === "cross-site") {
+    res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+    res.end("forbidden");
+    return;
+  }
+  const body = await readBodyWithin(req, 64 * 1024);
+  if (body === undefined) {
+    res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+    res.end("too large");
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end("bad json");
+    return;
+  }
+  const sessionId = sessionIdOf(payload?.sessionId);
+  if (sessionId === undefined) {
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end("bad session");
+    return;
+  }
+  const action = payload?.action;
+  /** @param status - HTTP status. @param value - JSON-ready payload. */
+  const reply = (status, value) => {
+    const bytes = Buffer.from(JSON.stringify(value), "utf8");
+    res.writeHead(status, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(bytes.length),
+      "cache-control": "no-store",
+    });
+    res.end(bytes);
+  };
+  if (action === "deliver") {
+    const accepted = deliverImage(sessionId, payload?.jobId, payload?.dataUrl);
+    reply(200, { ok: accepted });
+    return;
+  }
+  if (action === "fail") {
+    const accepted = failImage(sessionId, payload?.jobId, payload?.reason);
+    reply(200, { ok: accepted });
+    return;
+  }
+  if (action === "bye") {
+    releaseSession(sessionId);
+    reply(200, { ok: true });
+    return;
+  }
+  // A pane that is closed mid-poll aborts its fetch; the abort has to release
+  // the queued waiter, or the Host keeps a resolver alive for a pane that is
+  // never coming back.
+  const controller = new AbortController();
+  const onClose = () => controller.abort();
+  const hasEvents = typeof res.on === "function" && typeof res.removeListener === "function";
+  if (hasEvents) res.on("close", onClose);
+  // The page text lives in this Host's memory, but the index lives in the
+  // browser for as long as the tab does, and the two outlive each other in both
+  // directions: a plugin reload empties the store while the pane keeps a
+  // finished document. Telling the pane that its document is gone is the only
+  // way it can repair itself — it holds the pages, this side does not.
+  const known = resolveDocument(sessionId, typeof payload?.docId === "string" ? payload.docId : undefined) !== undefined;
+  try {
+    const work = await takeWork(sessionId, controller.signal);
+    if (controller.signal.aborted) return;
+    reply(200, work === null ? { ok: true, job: null, known } : { ok: true, job: work, known });
+  } finally {
+    if (hasEvents) res.removeListener("close", onClose);
+  }
 }
 
 /**
@@ -666,4 +882,55 @@ export function apply(ctx) {
     () => ctx.webServer.register({ kind: "exact", path: FILE_PATH, handler: (req, res) => fileHandler(ctx, req, res) }),
     "fast-pdf: file",
   );
+  ctx.effect(
+    () => ctx.webServer.register({ kind: "exact", path: SYNC_PATH, handler: syncHandler }),
+    "fast-pdf: sync",
+  );
+  ctx.effect(
+    () => ctx.webServer.register({ kind: "exact", path: WORK_PATH, handler: workHandler }),
+    "fast-pdf: work",
+  );
+  // The tools are optional: a Host without the tool service (or a profile where
+  // this plugin is loaded for its viewer alone) still gets a working reader, so
+  // registration is attempted rather than declared as a hard dependency.
+  ctx.effect(() => registerTools(ctx), "fast-pdf: tools");
+}
+
+/**
+ * Register the document tools if this Host has a tool service.
+ *
+ * Looked up through `ctx` instead of injected as a dependency for the reason
+ * `translate.js` gives: a third-party bundle that fails to activate takes the
+ * whole plugin down with it, and the viewer must keep working in a Host that
+ * has no tools at all.
+ * @param ctx - plugin context.
+ * @returns a disposer, or a no-op when there is nothing to register with.
+ */
+function registerTools(ctx) {
+  let tools;
+  try {
+    tools = typeof ctx?.get === "function" ? ctx.get("tools") : undefined;
+  } catch {
+    tools = undefined;
+  }
+  if (tools === undefined || typeof tools.register !== "function") return () => {};
+  const disposers = [];
+  for (const definition of createTools(ctx)) {
+    try {
+      disposers.push(tools.register(definition));
+    } catch (error) {
+      // One rejected definition must not cost the others; the likeliest cause is
+      // a name another plugin already owns.
+      console.error(`[fast-pdf] could not register ${definition.name}:`, error);
+    }
+  }
+  return () => {
+    for (const dispose of disposers) {
+      try {
+        dispose();
+      } catch {
+        // A disposer that has already run is not an error worth surfacing.
+      }
+    }
+  };
 }

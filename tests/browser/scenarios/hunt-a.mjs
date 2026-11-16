@@ -91,14 +91,14 @@ function buttonBy(label) {
 }
 
 /**
- * Press the fit toggle, whichever way round it currently reads.
- * @returns the title it carried, or null when there is no toggle.
+ * Press 适应宽度, the only width mode the toolbar offers now.
+ * @returns the title it carried, or null when the button is not there.
  */
 function clickFit(DICT) {
-  const toggle = buttonBy(DICT.fitPage) ?? buttonBy(DICT.fitWidth);
-  if (toggle === null) return null;
-  const title = toggle.getAttribute("title") ?? toggle.getAttribute("aria-label");
-  toggle.click();
+  const button = buttonBy(DICT.fitWidth);
+  if (button === null) return null;
+  const title = button.getAttribute("title") ?? button.getAttribute("aria-label");
+  button.click();
   return title;
 }
 
@@ -385,12 +385,12 @@ export default {
   },
 
   /**
-   * BUG: 整页显示 in a pane that is both narrow and short.
+   * 适应宽度 in a pane that is both narrow and short.
    *
-   * `computeZoom` floors the scale at 25%, so at some pane sizes "fit page" can
-   * only fit one axis. Measured: the frame's own scroll ranges, the first page's
-   * box against the frame's, and whether a scrollbar appears on either axis —
-   * once in the opening 适应宽度 and once after pressing 整页显示.
+   * The mode is the only one left and it is also the opening mode, so this
+   * measures the state a reader lands in: the frame's scroll ranges, the first
+   * page's box against the frame's, and whether a horizontal scrollbar appears
+   * (it must not — a page that overflows sideways is a bug, not a mode).
    */
   "a-fit": async ({ note, settle, click, text, DICT, frameTop }) => {
     const report = (tag) => {
@@ -416,15 +416,14 @@ export default {
     const hostBox = document.querySelector("#host").getBoundingClientRect();
     note("pane", `${Math.round(hostBox.width)}x${Math.round(hostBox.height)}`);
     report("width");
-    // One toggle, two readings: in 适应宽度 mode it offers 整页显示 and back.
-    note("toggleSaid", clickFit(DICT));
+    const openedZoom = text("#host .fp-zoom-count");
+    // The same button a reader presses: it must land on the zoom already shown.
+    note("fitSaid", clickFit(DICT));
     await settle(900);
     report("fit");
     note("fitFrameTop", frameTop());
-    // And back, so the same probe can be run in the other direction.
-    note("toggleSaidBack", clickFit(DICT));
-    await settle(900);
-    report("widthAgain");
+    note("fitZoomStable", text("#host .fp-zoom-count") === openedZoom);
+    report("again");
   },
 
   /**

@@ -18,7 +18,7 @@ const CMAP_URL = new URL("./cmaps/", import.meta.url).toString();
 const FONT_URL = new URL("./standard_fonts/", import.meta.url).toString();
 const WASM_URL = new URL("./wasm/", import.meta.url).toString();
 const ICC_URL = new URL("./iccs/", import.meta.url).toString();
-export const PDF_VIEWER_BUILD = "2026-11-15-proportional-spacing-v9";
+export const PDF_VIEWER_BUILD = "2026-11-16-reattach-paint-v15";
 
 export function runtimeDiagnostics(viewer, phase) {
   const port = viewer?.loadingTask?._worker?.port;
@@ -52,6 +52,13 @@ const WHEEL_COARSE_PX = 40;
 const WHEEL_FINE_PX_CAP = 10;
 const RENDER_MARGIN_PX = 1200;
 const SCROLL_SETTLE_MS = 100;
+/**
+ * How long after the last width change the resize preview is committed.
+ *
+ * The same 160 ms the pinch gesture uses: long enough to absorb the tail of a
+ * drag, short enough that the sharp re-raster arrives before it reads as lag.
+ */
+const RESIZE_SETTLE_MS = 160;
 
 export function wheelDeltaPixels(deltaY, deltaMode = 0, pageHeight = 800) {
   if (!Number.isFinite(deltaY)) return 0;
@@ -116,7 +123,7 @@ export class PdfViewer {
     this.pendingTimer = null;
     this.scrollFrame = 0;
     this.scrollSettleTimer = 0;
-    this.zoomMode = "page-fit";
+    this.zoomMode = "page-width";
     this.zoom = 1;
     this.pageGap = 14;
     this.baseWidth = 612;
@@ -145,6 +152,13 @@ export class PdfViewer {
     this.priorityPage = null;
     this.activePageRenders = 0;
     this.zoomAnimations = new Map();
+    /**
+     * The width-driven zoom being shown on the compositor, before it is laid
+     * out. Mirrors `pinch`, which does the same for a wheel gesture.
+     */
+    this.resize = null;
+    this.resizeFrame = 0;
+    this.resizeTimer = 0;
     this.textLayers = new Map();
     this.textMappings = new Map();
     this.highlightLayerCache = new Map();
@@ -427,6 +441,7 @@ export class PdfViewer {
   close() {
     this.cancelZoomAnimations();
     this.cancelPinch();
+    this.cancelResize();
     this.generation += 1;
     this.priorityPage = null;
     this.hitGeneration += 1;
@@ -574,6 +589,12 @@ export class PdfViewer {
       el.style.height = `${height * this.zoom}px`;
       el.style.setProperty("--scale-factor", String(this.zoom));
     }
+    // The page boxes now describe `this.zoom`. `setZoom` can skip its relayout
+    // when the geometry did not move, but only if the boxes on screen really
+    // were laid out for that zoom — a viewer that has never been laid out has
+    // `appliedZoom === undefined` and must take the full path even when the
+    // numbers happen to match.
+    this.appliedZoom = this.zoom;
   }
 
   applyPageSpacing() {
@@ -628,18 +649,22 @@ export class PdfViewer {
     }
   }
 
-  computeZoom() {
+  /**
+   * The zoom a mode would produce at the pane's current size.
+   *
+   * `mode` is a parameter because a resize preview needs the number the new
+   * width implies without adopting it: the committed zoom has to keep
+   * describing the layout that is actually on screen.
+   * @param mode - zoom mode; defaults to the committed one.
+   * @returns the scale that mode would produce right now.
+   */
+  computeZoom(mode = this.zoomMode) {
     const pad = 48;
-    const { width, height } = this.pageLayout(this.currentPage);
-    if (this.zoomMode === "page-width") {
+    if (mode === "page-width") {
+      const { width } = this.pageLayout(this.currentPage);
       return Math.max(0.25, (this.wrapEl.clientWidth - pad) / width);
     }
-    if (this.zoomMode === "page-fit") {
-      const sx = (this.wrapEl.clientWidth - pad) / width;
-      const sy = (this.wrapEl.clientHeight - pad) / height;
-      return Math.max(0.25, Math.min(sx, sy));
-    }
-    const n = Number(this.zoomMode);
+    const n = Number(mode);
     return Number.isFinite(n) ? Math.min(5, Math.max(0.25, n / 100)) : 1.5;
   }
 
@@ -686,9 +711,30 @@ export class PdfViewer {
   setZoom(mode, { silent = false, keepPage = true } = {}) {
     this.cancelZoomAnimations();
     this.cancelPinch();
+    // A preview stands for a size that is about to be replaced by this one;
+    // leaving its transform on would scale the new layout a second time.
+    this.cancelResize();
     const anchor = keepPage ? this.captureZoomAnchor() : null;
     this.zoomMode = String(mode);
     this.zoom = this.computeZoom();
+    // Re-attaching a parked document calls this only because the pane *may*
+    // have been resized while it was put away. Usually it was not, and then
+    // every page below is work that throws away raster and text layers which
+    // still describe the layout exactly: the reader pays for it as a blank
+    // frame (「黑着 0.几秒」) followed by the same pixels coming back. If the
+    // boxes on screen were laid out for the zoom this call just computed, the
+    // document is already correct and there is nothing to redo. `appliedZoom`
+    // is what makes that question answerable: a viewer that was never laid out
+    // has it undefined and must take the full path even when the numbers
+    // happen to match the `zoom: 1` it was born with.
+    if (this.appliedZoom !== undefined && Math.abs(this.zoom - this.appliedZoom) < 0.0005) {
+      if (anchor) this.restoreZoomAnchor(anchor);
+      // Pages that were never rendered can still be waiting on the viewport;
+      // without `force` this skips every page whose mark already matches.
+      void this.renderVisible();
+      this.notify();
+      return;
+    }
     this.textMappings.clear();
     this.highlightLayerCache.clear();
     this.highlightedPages.clear();
@@ -723,6 +769,105 @@ export class PdfViewer {
     this.renderVisible();
     this.notify();
     return gap;
+  }
+
+  /**
+   * Follow a width change without laying the document out again.
+   *
+   * Dragging the divider between the conversation and the pane changes the
+   * width on every frame. Committing each frame would run the whole of
+   * `setZoom` — clearing every page's rendered mark, hiding every text layer,
+   * rewriting all page boxes and re-rasterising the visible ones — to show a
+   * picture the compositor can produce from the raster already on screen. So
+   * the drag gets a transform, exactly as a pinch does, and the layout is paid
+   * for once, after the width stops moving.
+   *
+   * A mode that a transform cannot stand in for returns false and the caller
+   * commits as before: at a fixed percentage the document does not follow the
+   * width, so there is nothing to preview.
+   * @returns true when a preview is being shown.
+   */
+  previewResize() {
+    if (!this.pdf || this.pageEls.length === 0) return false;
+    if (this.zoomMode !== "page-width") return false;
+    const target = this.computeZoom();
+    if (this.pinch) return true;
+    if (!this.resize) {
+      const anchor = this.captureZoomAnchor();
+      const contentX = this.wrapEl.scrollLeft + this.wrapEl.clientWidth / 2;
+      const contentY = this.wrapEl.scrollTop + this.wrapEl.clientHeight / 2;
+      this.resize = {
+        zoom: this.zoom,
+        target,
+        anchor,
+        originX: contentX - (this.pagesEl.offsetLeft || 0),
+        originY: contentY - (this.pagesEl.offsetTop || 0),
+      };
+      clearTimeout(this.zoomTimer);
+      // The pages are being shown at a size the layout does not describe, so a
+      // render started now would be thrown away the moment the drag stops.
+      for (const job of [...this.activeRenderJobs]) this.cancelRenderJob(job);
+      this.pagesEl.style.transformOrigin = `${this.resize.originX}px ${this.resize.originY}px`;
+      this.pagesEl.style.willChange = "transform, transform-origin";
+    }
+    this.resize.target = target;
+    // One transform per frame at most: a drag can deliver several width
+    // readings between two paints, and only the last one can be seen.
+    if (this.resizeFrame === 0) {
+      this.resizeFrame = requestAnimationFrame(() => {
+        this.resizeFrame = 0;
+        const resize = this.resize;
+        if (!resize) return;
+        const ratio = resize.target / resize.zoom;
+        this.pagesEl.style.transform = `scale(${ratio})`;
+        this.onZoomPreview?.(resize.target * 100);
+      });
+    }
+    clearTimeout(this.resizeTimer);
+    this.resizeTimer = setTimeout(() => this.commitResize(), RESIZE_SETTLE_MS);
+    return true;
+  }
+
+  /**
+   * Throw away a resize preview, keeping the size already laid out.
+   *
+   * Used when the pane goes away mid-drag: the transform belongs to a node
+   * leaving the document, and a timer that fires after that would commit a
+   * width nobody is looking at.
+   */
+  cancelResize() {
+    // The timer goes first and unconditionally: a commit that is already queued
+    // must not fire after the drag was abandoned.
+    clearTimeout(this.resizeTimer);
+    this.resizeTimer = 0;
+    if (this.resizeFrame) cancelAnimationFrame(this.resizeFrame);
+    this.resizeFrame = 0;
+    if (!this.resize) return;
+    this.resize = null;
+    this.pagesEl.style.transform = "";
+    this.pagesEl.style.transformOrigin = "";
+    this.pagesEl.style.willChange = "";
+    this.onZoomPreview?.(this.zoomMode);
+  }
+
+  /**
+   * Lay the document out at the width the preview was standing in for.
+   *
+   * The preview is dropped before `setZoom` runs: it re-reads the anchor the
+   * preview captured, and restoring a transform and a layout at once would
+   * apply the same offset twice.
+   */
+  commitResize() {
+    const resize = this.resize;
+    if (!resize) return;
+    this.cancelResize();
+    // A parked viewer keeps its pages for the next attach, but its wrapper has
+    // left the document: laying out 779 boxes for a width nobody is showing is
+    // the cost this whole path exists to avoid. The next attach re-runs
+    // `setZoom` anyway.
+    if (this.wrapEl?.isConnected !== true) return;
+    this.setZoom(this.zoomMode, { keepPage: false, silent: true });
+    this.restoreZoomAnchor(resize.anchor);
   }
 
   // Keep the raster and text together on the compositor during zoom gestures.
@@ -1425,7 +1570,11 @@ export class PdfViewer {
     this.notify();
     requestAnimationFrame(() => {
       if (fromHistory) this.applyingHistory = false;
-      this.renderVisible(true).catch((error) => console.error("PDF rendering failed", error));
+      // Not `force`: moving the scroll position does not invalidate a single
+      // raster. Pages that match the current zoom are skipped by `renderPage`,
+      // which is what makes re-entering a document show its pages at once
+      // instead of rasterising them again behind a blank frame.
+      this.renderVisible().catch((error) => console.error("PDF rendering failed", error));
     });
   }
 

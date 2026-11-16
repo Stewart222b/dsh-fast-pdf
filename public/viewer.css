@@ -306,8 +306,37 @@
   flex: none;
 }
 
+/* A mode button has to look switched on from across the pane, and the faint
+   currentColor wash it had did not. Two things were wrong with it: 14% of
+   currentColor over a 28px ghost button is nearly invisible against the
+   toolbar's own tint (the pane's own report), and it was keyed on
+   `[data-pressed]` — an attribute the Host's `Button` drops, since `pressed` is
+   the only thing it forwards, as `aria-pressed`. So on the Host path the rule
+   never matched at all and only the plain fallback ever lit up.
+ *
+ * These are the find bar's two switches, repainted for the toolbar: accent
+ * fill, accent text and a ring. Same measure, same meaning — "this is a mode
+ * and it is on". Any toolbar button the Host paints as pressed gets it,
+ * including ⋯ while its menu is open, which is what a held-down button
+ * normally does. */
+.fp-toolbar button[aria-pressed="true"],
 .fp-toolbar button[data-pressed] {
-  background: color-mix(in oklab, currentColor 14%, transparent);
+  color: light-dark(#1d4ed8, #93c5fd);
+  background: color-mix(
+    in oklab,
+    var(--dsw-alias-button-info-fill, #3b82f6) 13%,
+    var(--dsw-alias-bg-layer-1, light-dark(#ffffff, #232324))
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--dsw-alias-button-info-fill, #3b82f6) 48%, transparent);
+}
+
+.fp-toolbar button[aria-pressed="true"]:hover:not(:disabled),
+.fp-toolbar button[data-pressed]:hover:not(:disabled) {
+  background: color-mix(
+    in oklab,
+    var(--dsw-alias-button-info-fill, #3b82f6) 20%,
+    var(--dsw-alias-bg-layer-1, light-dark(#ffffff, #232324))
+  );
 }
 
 .fp-body {
@@ -545,10 +574,10 @@ span.fp-outline-caret {
    It floats over the page, so unlike the rest of this file it needs an opaque
    surface of its own instead of a wash of `currentColor`.
 
-   Two wrappers, one look: `.fp-chip` is the pill that offers 翻译, `.fp-pick` is
-   the card it opens. They are separate elements because they live separately —
-   a pinned card can be on screen while the next selection's pill waits beside
-   it — and both are positioned by the same placement rules. */
+   Two wrappers, one look: `.fp-chip` is the pill that offers 翻译 and 问这段,
+   `.fp-pick` is the card it opens. They are separate elements because they live
+   separately — a pinned card can be on screen while the next selection's pill
+   waits beside it — and both are positioned by the same placement rules. */
 .fp-pick,
 .fp-chip {
   position: absolute;
@@ -560,13 +589,22 @@ span.fp-outline-caret {
 }
 
 .fp-chip {
-  inline-size: var(--fp-chip-width, 92px);
+  inline-size: var(--fp-chip-width, 168px);
+  /* Two offers share the box the placement rules reserved for it, and neither
+     may be squeezed to an ellipsis when the reserve was computed for two. */
+  gap: 4px;
 }
 
-/* The pill's own button fills the box the placement rules reserved for it. */
+/* The pill's own buttons fill the box the placement rules reserved for it,
+   splitting it evenly: the two offers are alternatives, not a primary action
+   with a menu attached, so neither is wider than the other. */
 .fp-chip > button {
-  flex: 1;
+  flex: 1 1 0;
+  min-inline-size: 0;
   padding-inline: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .fp-pick-action {

@@ -380,7 +380,13 @@ await check("a big PDF is streamed through the host half, past the Host's whole-
             controller.close();
           },
         }),
-        { status: 200, headers: { "content-length": String(payload.length) } },
+        {
+          status: 200,
+          headers: {
+            "content-length": String(payload.length),
+            "x-dsh-fast-pdf-version": "2049:1234567:3000001:1700000000000000000:1700000000000000001",
+          },
+        },
       ),
     (read) => read(ADDRESS, new AbortController().signal, (ratio) => seen.push(ratio)),
   );
@@ -395,7 +401,17 @@ await check("a big PDF is streamed through the host half, past the Host's whole-
   );
   assert.equal(result.bytes.length, payload.length, "every chunk lands in the buffer");
   assert.equal(Buffer.compare(Buffer.from(result.bytes), Buffer.from(payload)), 0, "the bytes are unchanged");
-  assert.equal(result.version, 1, "the body reports a version so the pane stops treating the tab as loading");
+  // The Host decides "this file changed" by comparing the version its own
+  // metadata carries with the version the body reports. A constant is never
+  // equal to `dev:ino:size:mtimeNs:ctimeNs`, so the Host judged every metadata
+  // frame a change, remounted the body and streamed the file a second time —
+  // the second progress bar the reader saw. The route's own token is what makes
+  // the comparison come out equal.
+  assert.equal(
+    result.version,
+    "2049:1234567:3000001:1700000000000000000:1700000000000000001",
+    "the body reports the version the route stat'ed, not a constant the Host can never match",
+  );
   assert.equal(seen.length >= 2, true, "progress is reported while bytes arrive");
   assert.equal(seen.every((ratio) => ratio > 0 && ratio <= 1), true, "and stays a fraction");
   assert.equal(seen.at(-1), 1, "and ends at one");
@@ -750,9 +766,9 @@ await check("the toolbar takes the Host's primitives when they are seeded", asyn
     "next",
     "zoomOut",
     "zoomIn",
-    // The fit button names what it will do: page-width is the current mode, so
-    // it offers page-fit.
-    "fitPage",
+    // Fit width is the only width mode now, so the button says one thing and
+    // does one thing.
+    "fitWidth",
     "more",
   ]);
   for (const node of buttons) {
@@ -760,6 +776,12 @@ await check("the toolbar takes the Host's primitives when they are seeded", asyn
     assert.equal(node.props.variant, "ghost", "and on its ghost variant");
     assert.equal(node.props.title, node.props["aria-label"], "the label doubles as the native tooltip");
   }
+  // Fit width is a mode, not a one-shot action: it stays lit, because while it
+  // is on a drag re-scales the page to keep filling the width. The other
+  // buttons act and are done.
+  const pressed = buttons.filter((node) => node.props["aria-pressed"] === true);
+  assert.equal(pressed.length, 1, "exactly one mode is lit");
+  assert.equal(pressed[0].props["aria-label"], "fitWidth", "it is fit width");
   // Icons: the Host set where it has one, a drawn path where it does not.
   const iconKinds = buttons.map((node) => (node.props.icon?.type === HostIcon ? "host" : "drawn"));
   assert.deepEqual(iconKinds, [
@@ -851,8 +873,77 @@ await check("settings persist the three reader preferences and apply them at the
   const reattach = source.slice(source.indexOf("const parkedRow ="), source.indexOf("// Everything below builds a viewer"));
   assert.match(reattach, /clearTimeout\(findTimer\.current\)/u, "re-attach cleanup cancels a pending find");
   assert.match(reattach, /detachHistory\(\)/u, "re-attach cleanup releases the history listener");
+  // A switch back to a document that is still open must not flash the opening
+  // overlay. The re-attach takes a couple of hundred milliseconds, and during
+  // it the first paint used to say "loading" with no byte count — which renders
+  // as the sweeping indeterminate bar, not the 0-100 one the reader had just
+  // finished watching. The decision has to be made before that first paint.
+  assert.match(source, /const cachedRow = peekOpenDocument\(String\(props\.resourceAddress \?\? ""\)\);/u,
+    "the first paint asks the cache whether this document is already open");
+  assert.match(source, /cachedRow !== undefined && cachedRow\.bytes !== undefined \? "ready" : "loading"/u,
+    "an open document paints as ready, so a switch back shows no progress bar at all");
+  assert.match(source, /function peekOpenDocument\(address\) \{[\s\S]{0,120}openDocuments\.get\(address\)/u,
+    "peeking must not take the entry out of the cache the re-attach path is about to read");
+  // And the pages themselves go back before that paint. The re-attach lives in
+  // a passive effect (it needs the bytes in state first), which runs *after*
+  // the browser paints — so the frame was on screen with no children and the
+  // reader saw its background for as long as the re-attach took (「黑着 0.几秒」).
+  // The parked container is already in hand at render time; a layout effect can
+  // put it back in the same pass.
+  const cachedPages = source.slice(source.indexOf("const cachedPages = cachedRow"), source.indexOf("}, [cachedPages]);"));
+  assert.match(cachedPages, /cachedRow\.pages !== undefined/u, "only a row that has pages is worth showing");
+  assert.match(cachedPages, /cachedRow\.bytes !== undefined/u, "the same byte check the build effect makes");
+  assert.match(cachedPages, /cachedRow\.moduleRevision === moduleRevision/u,
+    "a container from another viewer build must not be shown");
+  assert.match(cachedPages, /React\.useLayoutEffect\(\(\) => \{/u,
+    "it has to be a layout effect, or the empty frame paints first");
+  assert.match(cachedPages, /cachedPages\.parentNode === frame\) return;/u, "re-appending is a no-op");
+  assert.match(cachedPages, /frame\.appendChild\(cachedPages\)/u, "the parked container goes back where the effect would put it");
   assert.match(source, /trimmed !== "" && Number\.isFinite\(typed\) \? Math\.max\(0, typed\) : view\.page/u,
     "stepping from a typed 0 starts at page 1 instead of skipping ahead");
+});
+
+await check("fit width is one mode with one button, and the retired mode still opens", async () => {
+  // It was a two-way toggle: the label named the mode you would get, the icon
+  // named the mode you were in, and both were drawn in the same 16px box — the
+  // pane's own report of what confused readers. 整页显示 is gone; 适应宽度 is the
+  // only width mode, so the button says one thing and does one thing.
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.doesNotMatch(source, /page-fit/u, "the client has no fit-page mode left");
+  assert.doesNotMatch(source, /fitPage/u, "and no label or icon for one");
+  assert.match(source, /label: t\("fitWidth"\)/u, "the button names the mode it applies");
+  assert.match(source, /onClick: fitWidth,/u, "and applies exactly that");
+  // One mode, not a choice between two named modes: either turn this one on, or
+  // leave it at the size on screen.
+  assert.match(source, /const fitWidth = \(\) => \{[\s\S]{0,400}?setZoom\("page-width"\)/u,
+    "one mode, not a choice between two");
+  // Still a mode: while it is lit, a drag re-scales the page to keep filling
+  // the width. Without the lit state that behaviour reads as the button having
+  // worn off (the pane's own report: "点了适应宽度之后，拖动时又变成实时调整，再点加号才好").
+  assert.match(source, /pressed: view\.mode === "page-width"/u,
+    "the button lights while the mode is on");
+  // Pressing a lit mode button leaves the mode, keeping the size on screen —
+  // the same on/off the find bar's two switches have.
+  assert.match(source, /if \(current\.zoomMode === "page-width"\) \{\s*current\.setZoom\(String\(Math\.round\(current\.zoom \* 100\)\)\);/u,
+    "pressing it again freezes the current size instead of doing nothing");
+  assert.match(source, /mode: viewer\.zoomMode \?\? previous\.mode/u,
+    "and the view state carries the mode so it can");
+  // The settings dropdown offers the same set the preference module accepts.
+  const preferences = await import(pathToFileURL(join(PUBLIC, "preferences.mjs")).href);
+  assert.equal(preferences.DEFAULT_PREFERENCES.defaultZoom, "page-width",
+    "the default is the mode the button applies");
+  // A file written by the build that still had 整页显示 must not silently fall
+  // back to the default: the reader picked something, and the nearest thing to
+  // it is still there.
+  const stored = new Map([[preferences.PREFERENCES_KEY, JSON.stringify({ defaultZoom: "page-fit", pageGap: 20 })]]);
+  const storage = { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value) };
+  const migrated = preferences.readPreferences(storage);
+  assert.equal(migrated.defaultZoom, "page-width", "a retired zoom migrates instead of resetting");
+  assert.equal(migrated.pageGap, 20, "and the rest of the file survives the migration");
+  // The viewer has one width mode to compute.
+  const viewer = readFileSync(join(PUBLIC, "viewer.mjs"), "utf8");
+  assert.doesNotMatch(viewer, /page-fit/u, "the viewer computes no fit-page scale");
+  assert.match(viewer, /this\.zoomMode = "page-width";/u, "a new document opens at fit width");
 });
 
 await check("document properties show basic rows before metadata and ignore stale replies", async () => {
@@ -999,6 +1090,146 @@ await check("the pane asks for the app's typeface, not the code font", async () 
   assert.match(root[1], /font-family:\s*var\(--dsw-font,/u, ".fp-root does not opt out of the code font");
   assert.match(root[1], /white-space:\s*normal/u, ".fp-root does not reset the container's white-space: pre");
   assert.ok(!/monospace/u.test(rules), "viewer.css asks for a monospace family somewhere");
+});
+
+await check("the selection pill offers the conversation beside translation", async () => {
+  // Two offers, one pill: 翻译 answers in place, 问这段 hands the selection to
+  // the conversation. The width reserved for the bubble has to cover both, or
+  // the placement rules flip it to the wrong side of the anchor and the second
+  // button is clipped.
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  const width = /const PILL_WIDTH = (\d+);/u.exec(source);
+  assert.ok(width !== null, "PILL_WIDTH is gone");
+  assert.ok(Number(width[1]) >= 160, `the pill must reserve room for two offers, got ${width[1]}`);
+  const chip = /\.fp-chip\s*\{\s*inline-size:\s*var\(--fp-chip-width,\s*(\d+)px\)/u.exec(
+    readFileSync(join(PUBLIC, "viewer.css"), "utf8"),
+  );
+  assert.ok(chip !== null, "the chip's fallback width is gone");
+  assert.equal(Number(chip[1]), Number(width[1]), "the stylesheet fallback and the reserved width must agree");
+  assert.match(source, /t\("ask"\)/u, "the pill must render the 问这段 offer");
+  // The button's own path: the second offer calls `ask`, which hands the text to
+  // the conversation through the composer rather than opening a request of ours.
+  assert.match(source, /onClick: \(\) => ask\(chip\)/u, "the second offer must call ask(chip)");
+  assert.match(source, /askAboutSelection\(sessionId, current\.text, where\)/u, "ask must hand the text to the conversation");
+  for (const key of ["ask", "askLocation", "askNoDocument", "askFailed"]) {
+    assert.match(source, new RegExp(`\\n\\s+${key}:`, "u"), `the ${key} string is missing from the dictionaries`);
+  }
+});
+
+await check("the document text reaches the host above the search box's early return", async () => {
+  // `onIndex` starts with "nothing is being searched, stop here" — a reader's
+  // query. Uploading is not the reader's query and must not be behind it, or a
+  // document opened without searching is never readable from the conversation.
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  // Two spellings, because the two paths differ: a reattached viewer takes the
+  // handler by assignment, a new one takes it as a constructor option.
+  const handlers = [
+    ...source.split("viewer.onIndex = () => {").slice(1),
+    ...source.split("onIndex: () => {").slice(1),
+  ];
+  assert.equal(handlers.length, 2, "both the reattached and the fresh viewer set onIndex");
+  for (const body of handlers) {
+    const nudge = body.indexOf("serving?.nudge()");
+    const early = body.indexOf('findRef.current.query === ""');
+    assert.ok(nudge !== -1, "onIndex must nudge the upload");
+    assert.ok(early !== -1, "onIndex still short-circuits the search");
+    assert.ok(nudge < early, "the upload has to run before the search's early return");
+  }
+});
+
+await check("a resize previews on the compositor and commits once, not per frame", async () => {
+  // Dragging the divider changes the pane width every frame. Doing the full
+  // `setZoom` on each of those frames walks all page boxes, hides every text
+  // layer and re-rasterises the visible pages — for a picture the compositor can
+  // produce from the raster already on screen. A pinch already had this
+  // preview/commit split; a resize did not.
+  const viewer = readFileSync(join(PUBLIC, "viewer.mjs"), "utf8");
+  assert.match(viewer, /const RESIZE_SETTLE_MS = 160;/u, "the drag settles on the same beat as a pinch");
+  assert.match(viewer, /computeZoom\(mode = this\.zoomMode\)/u,
+    "a preview must price a width it has not adopted");
+  for (const name of ["previewResize", "cancelResize", "commitResize"]) {
+    assert.match(viewer, new RegExp(`\\n  ${name}\\(`, "u"), `viewer.mjs must define ${name}`);
+  }
+  // The preview itself may only touch the transform: that is the whole point.
+  const preview = viewer.slice(viewer.indexOf("  previewResize() {"), viewer.indexOf("  cancelResize() {"));
+  assert.doesNotMatch(preview, /applyPageLayout|renderVisible|renderedZoom|textLayers\.values/u,
+    "a preview frame must not lay out or re-rasterise anything");
+  assert.match(preview, /pagesEl\.style\.transform = `scale\(\$\{ratio\}\)`/u, "the preview is a transform");
+  assert.match(preview, /setTimeout\(\(\) => this\.commitResize\(\), RESIZE_SETTLE_MS\)/u,
+    "the layout is paid for once the width stops moving");
+  // Committing drops the preview first, so the anchor is not applied twice.
+  const commit = viewer.slice(viewer.indexOf("  commitResize() {"), viewer.indexOf("  // Keep the raster and text together"));
+  assert.ok(commit.indexOf("this.cancelResize()") < commit.indexOf("setZoom"), "cancel before commit");
+  assert.match(commit, /restoreZoomAnchor\(resize\.anchor\)/u, "the reading point survives the relayout");
+  // A parked viewer keeps its pages but its wrapper is out of the document; a
+  // timer that fires after the park must not lay those pages out.
+  assert.match(commit, /if \(this\.wrapEl\?\.isConnected !== true\) return;/u,
+    "a parked viewer is not relaid out");
+  // A new zoom or a closed document cannot inherit a stale transform.
+  assert.match(viewer, /cancelPinch\(\);\n    \/\/ A preview stands for a size/u, "setZoom drops the preview");
+  assert.match(viewer, /close\(\) \{\n    this\.cancelZoomAnimations\(\);\n    this\.cancelPinch\(\);\n    this\.cancelResize\(\);/u,
+    "close() drops the preview");
+  // And the pane routes its ResizeObserver through it.
+  const client = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.match(client, /if \(!current\.previewResize\(\)\) current\.setZoom\(/u,
+    "the ResizeObserver must try the preview first");
+  assert.match(client, /viewer\.resize\?\.target \?\? viewer\.zoom/u, "the readout follows the preview");
+});
+
+await check("a refused upload stops instead of retrying forever", async () => {
+  // The pane retries a failed chunk every three seconds, which is right for a
+  // Host that is restarting. It is wrong for a 400: the payload was refused, and
+  // repeating the same bytes produces the same refusal — on a document that is
+  // open all day that is a request every three seconds forever.
+  const source = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.match(source, /error\.status = Number\(response\.status\)/u, "the status must survive on the error");
+  assert.match(source, /giveUp = status === 400 \|\| status === 403/u, "a verdict is not retried");
+  // Every path that could send again: the nudge that fires on each indexed page,
+  // the retry timer, and the outline that may still arrive afterwards.
+  const verdicts = source.match(/\n        if \(stopped \|\| giveUp[^)]*\) return;/gu) ?? [];
+  assert.equal(verdicts.length, 3, "nudge, schedule and pushOutline must all respect the verdict");
+});
+
+await check("a pane whose Host forgot the document uploads it again", async () => {
+  // The store is Host module state and the index is browser state, so a plugin
+  // reload loses the pages while the pane still believes it finished. Measured
+  // once: 779 pages had been uploaded, the Host reloaded, and the conversation
+  // was told "no PDF has been read" with the manual open on screen — neither
+  // side could notice. The pane's poll is the only Host-to-pane channel, so the
+  // Host stamps `known` on the answer and the pane acts on it.
+  const client = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.match(client, /const RESYNC_COOLDOWN_MS = 60_000;/u, "a forgotten document must not be re-sent in a loop");
+  assert.match(client, /await postWork\(sessionId, \{ action: "poll", docId \}, signal\)/u,
+    "the poll must name the document so the Host can judge whether it still has it");
+  assert.match(client, /if \(answer\?\.known === false\) onForgotten\?\.\(\);/u, "the answer is acted on");
+  // The repair itself: the cursor goes back to the start, and `complete` with
+  // it — a closing word for a document the Host no longer holds is refused as a
+  // payload error, and that verdict would freeze the upload for good.
+  assert.match(client, /const resync = \(\) => \{[\s\S]*?sent = 0;[\s\S]*?outlineSent = false;[\s\S]*?complete = false;/u,
+    "a re-upload rewinds the cursor it already advanced");
+  assert.match(client, /if \(sent === 0\) return false;/u,
+    "the first moments after opening a document are not a loss");
+  const host = readFileSync(join(ROOT, "index.js"), "utf8");
+  assert.match(host, /const known = resolveDocument\(sessionId, /u, "the Host answers the question");
+});
+
+await check("the document tools are named and described for a model to choose between", async () => {
+  const { createTools } = await import(pathToFileURL(join(ROOT, "tools.js")).href);
+  const tools = createTools({ get: () => undefined });
+  for (const tool of tools) {
+    assert.match(tool.name, /^pdf_/u, `${tool.name} must be recognisable as this plugin's`);
+    assert.ok(tool.description.length > 60, `${tool.name} needs a description a model can act on`);
+    assert.doesNotMatch(tool.description, /TODO|FIXME/u);
+  }
+  // The four the design settled on, and the listing that makes a second document
+  // addressable at all.
+  assert.deepEqual(tools.map((tool) => tool.name), [
+    "pdf_search",
+    "pdf_read_pages",
+    "pdf_outline",
+    "pdf_page_image",
+    "pdf_list",
+  ]);
 });
 
 await check("the floating translate pill stays opaque while the pointer is on it", async () => {

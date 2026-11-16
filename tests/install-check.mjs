@@ -167,8 +167,11 @@ check(
   JSON.stringify(host.inject),
 );
 
-// 9. Applying it against a stand-in context must register both routes and nothing
-//    else, so a missing service cannot be the reason a restart shows no plugin.
+// 9. Applying it against a stand-in context must register every route and
+//    nothing else, so a missing service cannot be the reason a restart shows no
+//    plugin. The tool route is allowed to do nothing here: this context has no
+//    `get`, and the tools are an optional service the viewer must survive
+//    without.
 const routes = [];
 const effects = [];
 host.apply({
@@ -185,8 +188,8 @@ host.apply({
   },
 });
 check(
-  "applying the host half registers the four routes",
-  routes.join("|") === "prefix /fast-pdf|exact /fast-pdf/translate|exact /fast-pdf/hello|exact /fast-pdf/file",
+  "applying the host half registers the six routes",
+  routes.join("|") === "prefix /fast-pdf|exact /fast-pdf/translate|exact /fast-pdf/hello|exact /fast-pdf/file|exact /fast-pdf/sync|exact /fast-pdf/work",
   routes.join(" | "),
 );
 check(

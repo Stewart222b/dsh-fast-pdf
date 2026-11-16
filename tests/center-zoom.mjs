@@ -43,7 +43,6 @@ function makeViewer({ zoom = 1, scrollTop = 200, scrollLeft = 0, width = 600, he
       const fitWidth = (this.wrapEl.clientWidth - 48) / size.width;
       const fitHeight = (this.wrapEl.clientHeight - 48) / size.height;
       if (this.zoomMode === "page-width") return Math.max(0.25, fitWidth);
-      if (this.zoomMode === "page-fit") return Math.max(0.25, Math.min(fitWidth, fitHeight));
       const value = Number(this.zoomMode);
       return Math.max(0.25, Math.min(5, value / 100));
     },
@@ -98,12 +97,14 @@ assert.equal(toolbar.zoomMode, "100");
 assert.ok(Math.abs(toolbarAfter.point[0] - toolbarBefore.point[0]) < 1e-6, "toolbar zoom out should preserve center x");
 assert.ok(Math.abs(toolbarAfter.point[1] - toolbarBefore.point[1]) < 1e-6, "toolbar zoom out should preserve center y");
 clearTimeout(toolbar.zoomTimer);
+// `page-width` is the only width-following mode left: it is what the toolbar
+// button, the default preference and the resize preview all mean.
 const fit = makeViewer({ scrollTop: 500 });
 const fitBefore = centerPdfPoint(fit);
-fit.setZoom("page-fit", { silent: true });
+fit.setZoom("page-width", { silent: true });
 const fitAfter = centerPdfPoint(fit);
-assert.ok(Math.abs(fitAfter.point[0] - fitBefore.point[0]) < 1e-6, "fit zoom should preserve center x");
-assert.ok(Math.abs(fitAfter.point[1] - fitBefore.point[1]) < 1e-6, "fit zoom should preserve center y");
+assert.ok(Math.abs(fitAfter.point[0] - fitBefore.point[0]) < 1e-6, "fit width should preserve center x");
+assert.ok(Math.abs(fitAfter.point[1] - fitBefore.point[1]) < 1e-6, "fit width should preserve center y");
 
 const rotated = makeViewer({ width: 1000, height: 600, rotation: 90, pages: 2, scrollTop: 900, scrollLeft: 100 });
 const rotatedBefore = centerPdfPoint(rotated);
