@@ -1825,6 +1825,19 @@ window.__ModuleLoader__.load({
       const tabIdRef = React.useRef(tabId);
       tabIdRef.current = tabId;
       const tabSignal = tab?.signal;
+      // Where a citation asked this tab to open. The conversation turns a
+      // `[p.141](manual.pdf#L141)` link into a sidebar navigation carrying that
+      // number as a line, which is the only navigation parameter a PDF address
+      // can arrive with — so on this body it means a page.
+      const navigation = tab?.navigation;
+      // A citation may arrive before the document has finished opening (the tab
+      // was opened *by* the citation), so the page is remembered until there is
+      // a viewer with pages to jump in.
+      const pendingCalloutRef = React.useRef(null);
+      // The navigation already honoured. `revision` increments on every
+      // navigation to this tab, so comparing it means a re-render does not
+      // re-jump while a second click on the same link does.
+      const appliedCalloutRef = React.useRef(-1);
       const retainTab = props.retainTab;
       React.useEffect(() => {
         if (typeof retainTab === "function" && tabId !== undefined) retainTab(tabId, tabSignal);
@@ -3159,6 +3172,13 @@ window.__ModuleLoader__.load({
         /** The cache row this effect owns, once there is something worth keeping. */
         let entry = null;
         const address = sourceAddress;
+        // Where this viewer's reading position is filed. `savePlace` writes with
+        // this ref while every reader looks up `tabId|address`, so leaving it at
+        // "" — which is what a freshly opened document used to do, since only the
+        // re-attach branch ever assigned it — meant the first place saved for a
+        // document went to a key nothing reads, and a document that left the
+        // cache came back at the top.
+        viewerAddress.current = address;
         /**
          * The two background jobs this pane runs for the conversation: uploading
          * page text, and rendering pages the Host asks for. Both stop with the
@@ -3602,6 +3622,16 @@ window.__ModuleLoader__.load({
             viewer.setZoom(savedPreferences.defaultZoom, { silent: true });
           }
           finishOpenProgress();
+          // A citation that opened this tab could not jump before there was a
+          // document to jump in; do it now, before the first paint settles.
+          const callout = pendingCalloutRef.current;
+          if (callout !== null) {
+            pendingCalloutRef.current = null;
+            viewer.goToPage(Math.min(Math.max(1, callout), Math.max(1, viewer.pageCount || callout)), {
+              push: true,
+              instant: true,
+            });
+          }
           startServing(viewer);
           sync();
           // From here on this viewer is worth keeping: a switch away parks it
@@ -3683,6 +3713,27 @@ window.__ModuleLoader__.load({
       }, [pane]);
 
       const viewer = () => viewerRef.current;
+
+      // Act on a citation as soon as one arrives. Placed after the effect that
+      // opens the document, so on the very first mount the viewer already
+      // exists; when it does not — the open is still in flight — the page waits
+      // in `pendingCalloutRef` for that effect to pick it up.
+      React.useEffect(() => {
+        const page = navigation?.params?.line;
+        const revision = navigation?.revision;
+        if (typeof page !== "number" || !Number.isFinite(page) || page < 1) return;
+        if (typeof revision === "number") {
+          if (appliedCalloutRef.current === revision) return;
+          appliedCalloutRef.current = revision;
+        }
+        const current = viewerRef.current;
+        if (current === null || !(current.pageCount > 0)) {
+          pendingCalloutRef.current = page;
+          return;
+        }
+        current.goToPage(Math.min(Math.round(page), Math.max(1, current.pageCount)), { push: true, instant: true });
+        sync();
+      }, [navigation?.params, navigation?.revision, sync]);
 
       const go = (delta) => {
         const current = viewer();

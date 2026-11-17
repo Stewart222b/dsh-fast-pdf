@@ -346,7 +346,9 @@ await check("search renders page numbers the model can cite", async () => {
   const search = tools.find((tool) => tool.name === "pdf_search");
   const value = await search.execute({ query: "255.0.0.0" }, exec("s-1"));
   const rendered = search.output.render({ query: "255.0.0.0" }, value);
-  assert.match(rendered[0].text, /p\.2:/u);
+  // A hit names its page twice over: `p.2` for a reader, and a link the
+  // conversation renders as a button that opens the document at that page.
+  assert.match(rendered[0].text, /\[p\.2\]\(d-cite\.pdf#L2\):/u);
   assert.match(rendered[0].text, /3\/3 pages searchable/u);
 });
 
@@ -361,7 +363,77 @@ await check("read_pages accepts a range, a list and a single number", async () =
   assert.deepEqual(list.pages.map((page) => page.pageNumber), [1, 2, 7]);
   const single = await read.execute({ pages: "9" }, exec("s-1"));
   assert.deepEqual(single.pages.map((page) => page.pageNumber), [9]);
-  assert.match(read.output.render({}, range)[0].text, /--- p\.3 ---/u);
+  assert.match(read.output.render({}, range)[0].text, /--- \[p\.3\]\(d-read\.pdf#L3\) ---/u);
+});
+
+await check("every tool that names a page hands back a link, not just a number", async () => {
+  // A tool description telling the model to "cite p.N" produces plain text the
+  // reader cannot click. The link has to arrive already assembled, and the
+  // description has to say to copy it, or the feature exists only in the tests.
+  const { createTools } = await import(pathToFileURL(join(ROOT, "tools.js")).href);
+  const tools = createTools({ get: () => undefined });
+  for (const name of ["pdf_search", "pdf_read_pages", "pdf_outline"]) {
+    const tool = tools.find((candidate) => candidate.name === name);
+    assert.match(tool.description, /\[p\.\d+\]\(/u, `${name} must show the model the link shape`);
+    assert.match(tool.description, /copy/iu, `${name} must say to copy it`);
+  }
+  // And no tool may still claim the pane is required, now that pdf_open exists.
+  for (const tool of tools) {
+    if (tool.name === "pdf_page_image") continue; // this one really does need it
+    assert.doesNotMatch(tool.description, /open in the document preview pane/iu,
+      `${tool.name} must not send the model to a pane it does not need`);
+  }
+});
+
+await check("a citation is a link the conversation can turn into a jump", async () => {
+  store.resetDocuments();
+  seed("d-cite", 3);
+  const tools = createTools({ get: () => undefined });
+  const search = tools.find((tool) => tool.name === "pdf_search");
+  const value = await search.execute({ query: "page 2" }, exec("s-1"));
+  // The destination is what matters: the conversation's renderer parses a link
+  // destination as a file and opens it at the line it names, and a PDF has no
+  // lines — so the page number rides in the line slot. `dsh-resource://` must
+  // not appear, because that renderer refuses it.
+  assert.equal(value.document.cite, "d-cite.pdf");
+  const text = search.output.render({ query: "page 2" }, value)[0].text;
+  assert.match(text, /\[p\.2\]\(d-cite\.pdf#L2\)/u, "the page must be a link, not just a number");
+  assert.doesNotMatch(text, /dsh-resource:/u, "the renderer refuses resource addresses");
+});
+
+await check("a citation encodes spaces but not the separators", async () => {
+  store.resetDocuments();
+  store.writeDocument({
+    sessionId: "s-1",
+    docId: "d-space",
+    title: "IMPACT 4 5.pdf",
+    address: "dsh-resource://file/session/s-1/IMPACT_4_5 User Manual.pdf",
+    pageCount: 2,
+    pages: [{ pageNumber: 1, text: "alpha" }, { pageNumber: 2, text: "beta" }],
+    complete: true,
+  });
+  const tools = createTools({ get: () => undefined });
+  const read = tools.find((tool) => tool.name === "pdf_read_pages");
+  const value = await read.execute({ pages: "2" }, exec("s-1"));
+  assert.equal(value.document.cite, "IMPACT_4_5%20User%20Manual.pdf");
+  const text = read.output.render({}, value)[0].text;
+  assert.match(text, /\[p\.2\]\(IMPACT_4_5%20User%20Manual\.pdf#L2\)/u);
+});
+
+await check("a document read by path gets the address the pane would use", async () => {
+  // A `pdf_open` address used to be absolute for every file, which made a
+  // citation a long machine path and gave the same in-workspace manual a
+  // different identity from the one the pane had already stored. Both are
+  // fixed by addressing an in-workspace file the way the pane does.
+  store.resetDocuments();
+  const { fileAddressFor, citationTargetOf } = await import(pathToFileURL(join(ROOT, "paths.js")).href);
+  const ctx = { get: (name) => (name === "sandboxPolicy" ? { workspaceRoot: "/home/u/work" } : undefined) };
+  const inside = fileAddressFor(ctx, "s-1", "/home/u/work/a b.pdf");
+  assert.equal(inside, "dsh-resource://file/session/s-1/a%20b.pdf");
+  assert.equal(citationTargetOf(inside), "a%20b.pdf", "a workspace file cites as a relative path");
+  const outside = fileAddressFor(ctx, "s-1", "/tmp/out.pdf");
+  assert.equal(outside, "dsh-resource://file/absolute/tmp/out.pdf");
+  assert.equal(citationTargetOf(outside), "/tmp/out.pdf");
 });
 
 await check("read_pages refuses a page the document does not have", async () => {

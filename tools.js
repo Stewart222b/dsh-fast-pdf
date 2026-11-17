@@ -34,7 +34,7 @@ import {
 } from "./documents.js";
 import { requestPageImage } from "./bridge.js";
 import { extractPdf, resolvePdfPath } from "./extract.js";
-import { fileNameOf } from "./paths.js";
+import { citationTargetOf, fileAddressFor, fileNameOf } from "./paths.js";
 
 /** Most pages one `pdf_read_pages` call may return. */
 const MAX_READ_PAGES = 12;
@@ -74,6 +74,7 @@ const DOCUMENT_SCHEMA = {
     pageCount: { type: "integer" },
     indexedPages: { type: "integer" },
     complete: { type: "boolean" },
+    cite: { type: "string" },
   },
 };
 
@@ -122,7 +123,27 @@ function describe(entry) {
     pageCount: entry.pageCount,
     indexedPages: indexedPageCount(entry),
     complete: entry.complete === true,
+    cite: citationTargetOf(entry.address) ?? "",
   };
+}
+
+/**
+ * A page reference the conversation can turn into a jump.
+ *
+ * The renderer behind the assistant's Markdown recognises a link whose
+ * destination it parses as a file, and opens that file at the line the
+ * destination names. A PDF has no lines, so this reuses the same slot to carry a
+ * page: `#L141` reaches the pane as `{ line: 141 }`, which the pane reads as a
+ * page number. Spelling it in one function rather than describing it in prose
+ * means the model copies a token instead of assembling one — and means every
+ * tool emits the identical shape.
+ * @param cite - the document's citation destination, from `describe`.
+ * @param pageNumber - the page being cited.
+ * @returns the link, or a plain `p.N` when the document has no address.
+ */
+function pageLink(cite, pageNumber) {
+  const number = String(pageNumber);
+  return typeof cite === "string" && cite !== "" ? `[p.${number}](${cite}#L${number})` : `p.${number}`;
 }
 
 /**
@@ -301,7 +322,9 @@ export function createTools(ctx) {
         // bytes, so they agree, and matching on them lets this call extend what
         // the pane already uploaded rather than parse a second copy.
         const existing = findByFingerprints(sessionId, result.fingerprints);
-        const address = `dsh-resource://file/absolute${located.path.startsWith("/") ? "" : "/"}${located.path}`;
+        // The same address the pane would use for this file, so a citation can
+        // be short and the two entry points agree on one identity.
+        const address = fileAddressFor(ctx, sessionId, located.path);
         const docId = existing?.docId ?? documentIdOf(address, result.fingerprints);
         const entry = writeDocument({
           sessionId,
@@ -331,7 +354,7 @@ export function createTools(ctx) {
     {
       name: "pdf_search",
       description:
-        "Search the text of the PDF open in the document preview pane. Returns matching page numbers with a short snippet of context around each hit. Use this first for a fact that should appear verbatim in the document (an error code, an option name, a setting); cite the pages it returns as `p.N`.",
+        "Search the text of a PDF this conversation has read. Returns matching page numbers with a short snippet of context around each hit. Use this first for a fact that should appear verbatim in the document (an error code, an option name, a setting). Each page comes back as a ready-made link like [p.141](manual.pdf#L141): copy it verbatim into your answer and the reader becomes a jump to that page, so a page reference the user can click costs you nothing to write.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -398,7 +421,7 @@ export function createTools(ctx) {
     {
       name: "pdf_read_pages",
       description:
-        "Read the text of specific pages of the PDF open in the document preview pane. Pages are 1-based; pass a list, or a string like `3-7` or `3,7-9`. Returns each page's extracted text, so treat it as the document's own words and cite `p.N`.",
+        "Read the text of specific pages of a PDF this conversation has read. Pages are 1-based; pass a list, or a string like `3-7` or `3,7-9`. Returns each page's extracted text, so treat it as the document's own words. Each page heading is a link like [p.141](manual.pdf#L141): copy the ones you quote, and the answer jumps to them when clicked.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -491,7 +514,7 @@ export function createTools(ctx) {
     {
       name: "pdf_outline",
       description:
-        "Report the table of contents of the PDF open in the document preview pane, with the page each entry starts on. Use it to find which chapter covers a topic before searching or reading. Pass `query` to filter by title.",
+        "Report a PDF's table of contents, with the page each entry starts on. Use it to find which chapter covers a topic before searching or reading. Each entry ends with a link like [p.141](manual.pdf#L141) — copy it to cite the section, and the reader jumps there. Pass `query` to filter by title.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -555,7 +578,7 @@ export function createTools(ctx) {
     {
       name: "pdf_page_image",
       description:
-        "Render one page of the PDF as an image and look at it. Use this when the text layer is not enough: a diagram, a chart, a scanned page, a photo of a connector panel, a table whose layout carries the meaning. Requires a model that accepts images.",
+        "Render one page of a PDF as an image and look at it. Use this when the text layer is not enough: a diagram, a chart, a scanned page, a photo of a connector panel, a table whose layout carries the meaning. Requires a model that accepts images. The page is drawn by the document preview pane, so with no pane open this returns the page's text instead of a picture.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -742,7 +765,8 @@ function renderOpen(value) {
 function renderSearch(value) {
   if (value.note !== undefined && value.hits.length === 0) return value.note;
   const head = `${value.document.title} (${value.document.indexedPages}/${value.document.pageCount} pages searchable)`;
-  const lines = value.hits.map((hit) => `p.${hit.pageNumber}: ${hit.snippet}`);
+  const cite = value.document.cite;
+  const lines = value.hits.map((hit) => `${pageLink(cite, hit.pageNumber)}: ${hit.snippet}`);
   return [head, ...lines, ...(value.note === undefined ? [] : ["", value.note])].join("\n");
 }
 
@@ -753,17 +777,22 @@ function renderSearch(value) {
  */
 function renderPages(value) {
   if (value.pages.length === 0) return value.note ?? "No pages were read.";
+  const cite = value.document.cite ?? "";
+  /** One page's heading, as a jump when the document has an address. */
+  const heading = (number) => `--- ${pageLink(cite, number)} ---`;
   const parts = [`${value.document.title} (${value.document.pageCount} pages)`];
   for (const page of value.pages) {
     if (page.pending === true) {
-      parts.push(`--- p.${page.pageNumber} ---\n(not read yet)`);
+      parts.push(`${heading(page.pageNumber)}\n(not read yet)`);
       continue;
     }
     if (page.empty === true) {
-      parts.push(`--- p.${page.pageNumber} ---\n(no text on this page; it may be an image — pdf_page_image can look at it)`);
+      parts.push(
+        `${heading(page.pageNumber)}\n(no text on this page; it may be an image — pdf_page_image can look at it)`,
+      );
       continue;
     }
-    parts.push(`--- p.${page.pageNumber} ---\n${page.text}`);
+    parts.push(`${heading(page.pageNumber)}\n${page.text}`);
   }
   if (value.truncated === true) parts.push("(output truncated; ask for fewer pages to see the rest)");
   if (value.note !== undefined) parts.push(value.note);
@@ -777,9 +806,11 @@ function renderPages(value) {
  */
 function renderOutline(value) {
   if (value.entries.length === 0) return value.note ?? "No outline entries.";
+  const cite = value.document.cite ?? "";
   const lines = value.entries.map((row) => {
     const indent = "  ".repeat(Math.min(row.depth, 8));
-    return `${indent}${row.title}${row.page === undefined ? "" : ` — p.${row.page}`}`;
+    if (row.page === undefined) return `${indent}${row.title}`;
+    return `${indent}${row.title} — ${pageLink(cite, row.page)}`;
   });
   return [`Table of contents of ${value.document.title}`, ...lines, ...(value.note === undefined ? [] : ["", value.note])].join(
     "\n",

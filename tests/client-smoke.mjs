@@ -1232,6 +1232,46 @@ await check("the pane tells the Host which file it sent, not just where", async 
     "the identity must be the raw array's own join, matching the browser's");
 });
 
+await check("a reading position is filed where the next open looks for it", async () => {
+  // `savePlace` writes the position under `tabId|viewerAddress`, while both
+  // readers look it up under `tabId|address`. Those two only agree if the ref
+  // names the document the viewer actually holds — and it used to be assigned
+  // only in the re-attach branch, so a document's very first place was written
+  // under `tabId|` and never read again.
+  const client = readFileSync(join(ROOT, "client.js"), "utf8");
+  const writes = client.match(/viewerAddress\.current = [^;]+;/gu) ?? [];
+  assert.ok(writes.length >= 2, `the ref must be set on both paths, found ${writes.length}`);
+  assert.ok(
+    writes.some((line) => /viewerAddress\.current = address;/u.test(line)),
+    "a freshly opened viewer must name its own document, not leave the ref empty",
+  );
+  // The reader keys, so the assertion can name what the write has to match.
+  assert.match(client, /places\.get\(`\$\{tabIdRef\.current\}\|\$\{address\}`\)/u,
+    "readers look the place up by the document address");
+  assert.match(client, /rememberPlace\(`\$\{tabIdRef\.current\}\|\$\{viewerAddress\.current\}`/u,
+    "the writer files it under the viewer's address");
+});
+
+await check("the pane jumps to the page a citation names", async () => {
+  // The conversation turns a `[p.141](manual.pdf#L141)` link into a sidebar
+  // navigation. Its destination is parsed as a file opened "at line 141", and a
+  // PDF has no lines — so the body reads that number as a page. Without this the
+  // link would open the document and stay on page 1, which looks like a jump
+  // that silently did nothing.
+  const client = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.match(client, /const navigation = tab\?\.navigation;/u, "the body must read the tab's navigation");
+  assert.match(client, /navigation\?\.params\?\.line/u, "the cited page arrives as the navigation's line");
+  assert.match(client, /pendingCalloutRef/u, "a citation can arrive before the document has opened");
+  assert.match(client, /appliedCalloutRef\.current === revision/u,
+    "one navigation must jump once, not on every re-render");
+  // Both entry points: a citation that opened the tab, and one into a document
+  // already on screen.
+  assert.match(client, /current\.goToPage\(Math\.min\(Math\.round\(page\)/u,
+    "an already-open document must jump on its own");
+  assert.match(client, /viewer\.goToPage\(Math\.min\(Math\.max\(1, callout\)/u,
+    "a citation that opened the tab must jump once it has pages");
+});
+
 await check("the document tools are named and described for a model to choose between", async () => {
   const { createTools } = await import(pathToFileURL(join(ROOT, "tools.js")).href);
   const tools = createTools({ get: () => undefined });

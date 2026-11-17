@@ -171,6 +171,14 @@ primitives.Button; primitives.Tooltip; primitives.IconSearchOutlineRegular; prim
 
 **一份手册开在两个对话里，存两份。** 这个 `docId` 里没有会话：地址是 `dsh-resource://file/session/<sessionId>/<path>`，哈希出来的字符串两个对话会算成同一个（地址里那个 session 段是"谁在问这份文件"，不是"文件是谁的"）。所以存储的键是**会话加 docId 两段**，不是一个 docId。原先只按 docId 存，后写的那个会话会把 `sessionId` 盖掉 —— 前一个对话刚索引完的手册会从它的 `pdf_list` 里消失，没有任何报错。两份的代价是页文本存两遍（779 页那份是 559 KB），这个仓库在这个地方的选择是"读的人能查准"优先于"省一份缓冲区"。断言在 `tests/document-tools.mjs` 的 `two sessions sending one document id keep separate copies`：两个会话写同一个 id，各读各的文本，且后写的一方不搬走所有权。
 
+**页码变回一次跳转。** 答案里写「见 p.141」在读者手里是死字：他知道第 141 页在哪，还是得自己翻。所以工具回来的页码不是数字，是一个已经拼好的链接 —— `[p.141](IMPACT_4_5%20User%20Manual.pdf#L141)` —— 而且工具描述里明确说「照抄它」。
+
+这条路能走通是因为 DSH 前端本来就有一条给文件链接用的通道。会话渲染 Markdown 时，链接目标会先过一次 `P4(dest)`：能解析成本地文件的话，不渲染成 `<a>`，渲染成一个按钮，点击走 `openFile(path, {line})` → `ctx.sidebarRight.openResource(url, {params: {line}})` → 标签页的 `tab.navigation.params.line`。PDF 没有"行"，所以这里把页号搭在同一班车上：`#L141` 到面板手里就是 `{ line: 141 }`，面板把它当页号读。
+
+两个约束是量出来的，不是猜的。**链接目标不能是 `dsh-resource://` 地址** —— 实测 `P4` 对它是 `undefined`（外部 URL 一律拒），所以引用必须写成工作区相对路径或绝对路径，`citationTargetOf` 就是干这个转换的。**转义必须按路径段做**，整串 `encodeURIComponent` 会把分隔符 `/` 也编码掉；而 `P4` 在解析前会解码一次，所以按段编码正好还原成原路径。文件名里带空格、括号、中文都验过。
+
+面板侧只有一处要注意：`params.line` 会在每次导航时重新出现，所以用 `navigation.revision` 去重（`#L141` 这次还没应用过才跳），否则任何一次重渲染都会把读者拽回那一页。跳转有两个入口 —— 点链接时文档已经开着，直接 `goToPage`；点链接才打开文档，`goToPage` 时还没有页，页号先存进 `pendingCalloutRef`，等视图器 `open()` 完成后在首帧前消费掉。
+
 **降级都有话说。** 没开文档、文档还没索引到那一页、这一页没有文本层（扫描件）、宿主没有 `tools` 服务、当前模型不接受图像 —— 每一条都是一句话，写在工具结果里给模型读，而不是抛异常把这一轮对话打断。`tools` 服务是可选依赖：拿不到时 PDF 预览照常工作，只是对话里看不见这份文档。
 
 ## 阅读手势

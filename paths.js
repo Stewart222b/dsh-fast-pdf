@@ -124,3 +124,74 @@ export function fileNameOf(target) {
     return last;
   }
 }
+
+/**
+ * The path to put in a citation link, from a document's stored address.
+ *
+ * A citation is a Markdown link the conversation's own renderer turns into a
+ * button, and that renderer only recognises a destination it can parse as a
+ * file: a workspace-relative path or an absolute one. It rejects
+ * `dsh-resource://` addresses, so the address a document is stored under is not
+ * the address a citation may use — this converts one into the other.
+ *
+ * The escaping matters as much as the path. Markdown link destinations may not
+ * contain spaces, and the renderer decodes URL escapes exactly once before
+ * parsing, so percent-encoding each segment produces the original path at the
+ * far end. Encoding the whole string would encode its separators too.
+ * @param address - a `dsh-resource://file/...` address.
+ * @returns the citation-ready destination, or undefined when unusable.
+ */
+export function citationTargetOf(address) {
+  const parsed = parseFileAddress(address);
+  if (parsed === null) return undefined;
+  const path = parsed.path.replace(/\\/gu, "/");
+  if (path === "") return undefined;
+  const encoded = path
+    .split("/")
+    .map((segment) => {
+      try {
+        return encodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
+  return encoded === "" ? undefined : encoded;
+}
+
+/**
+ * The address a document is stored under, for a path this Host resolved.
+ *
+ * Two halves of this plugin reach the same file and must agree on its identity:
+ * the pane, which names a file by the tab address it already has, and the Host,
+ * which resolves a path itself. A `docId` is derived from the address, so the
+ * two only coincide when the addresses coincide.
+ *
+ * A file inside the session's workspace therefore gets the same
+ * `session/<id>/<relative path>` shape the pane uses — which also makes a
+ * citation short and relative, the way a person would write it. Anything outside
+ * the workspace has no relative spelling, and keeps the `absolute` form.
+ * @param ctx - plugin context.
+ * @param sessionId - the session the document belongs to.
+ * @param path - an absolute path.
+ * @returns a `dsh-resource://file/...` address.
+ */
+export function fileAddressFor(ctx, sessionId, path) {
+  const text = String(path ?? "").replace(/\\/gu, "/");
+  /** @param segment - one path segment. @returns it, encoded. */
+  const encode = (segment) => {
+    try {
+      return encodeURIComponent(segment);
+    } catch {
+      return segment;
+    }
+  };
+  const root = String(workspaceRootFor(ctx, sessionId) ?? "").replace(/\\/gu, "/").replace(/\/+$/u, "");
+  if (root !== "" && text !== root && text.startsWith(`${root}/`)) {
+    const relative = text.slice(root.length + 1);
+    const encoded = relative.split("/").filter((part) => part !== "").map(encode).join("/");
+    if (encoded !== "") return `${FILE_ADDRESS_PREFIX}session/${encode(sessionId)}/${encoded}`;
+  }
+  const absolute = text.startsWith("/") ? text : `/${text}`;
+  return `${FILE_ADDRESS_PREFIX}absolute${absolute.split("/").map(encode).join("/")}`;
+}
