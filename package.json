@@ -11,7 +11,7 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node tests/center-zoom.mjs && node tests/client-smoke.mjs && node tests/document-tools.mjs && node tests/host-route-live.mjs && node tests/install-check.mjs && node tests/pinch-spacing.mjs && node tests/preferences.mjs && node tests/reattach-paint.mjs && node tests/render-queue.mjs && node tests/scroll-diagnostics.mjs && node tests/scroll-lookup.mjs && node tests/search-navigation.mjs && node tests/translation-options.mjs && node tests/viewer-reattach.mjs && node tests/visual-diff-test.mjs && node tests/wheel-pinch.mjs",
+    "test": "node tests/body-reads-without-handle.mjs && node tests/center-zoom.mjs && node tests/client-smoke.mjs && node tests/document-tools.mjs && node tests/host-route-live.mjs && node tests/install-check.mjs && node tests/pinch-spacing.mjs && node tests/preferences.mjs && node tests/reattach-paint.mjs && node tests/render-queue.mjs && node tests/scroll-diagnostics.mjs && node tests/scroll-lookup.mjs && node tests/search-navigation.mjs && node tests/translation-options.mjs && node tests/viewer-reattach.mjs && node tests/visual-diff-test.mjs && node tests/wheel-pinch.mjs",
     "check:install": "node tests/install-check.mjs",
     "check:documents": "node tests/document-tools.mjs",
     "check:host": "node tests/host-live.mjs",

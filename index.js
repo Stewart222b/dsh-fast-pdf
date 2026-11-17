@@ -34,6 +34,7 @@ import { documentsForSession, resolveDocument, writeDocument } from "./documents
 import { deliverImage, failImage, releaseSession, takeWork } from "./bridge.js";
 import { readBodyWithin } from "./http-body.js";
 import { createTools } from "./tools.js";
+import { isAbsoluteWorkspacePath, parseFileAddress, workspaceRootFor } from "./paths.js";
 
 export const name = "fast-pdf";
 
@@ -122,18 +123,6 @@ const MAX_SYNC_BODY = 8 * 1024 * 1024;
  * the real size, and the body turns that into the one sentence that names it.
  */
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
-
-/**
- * Whether a path is absolute in either spelling the Host accepts: POSIX
- * (`/a/b`), a Windows drive (`C:/a/b`) or a UNC path (`//server/share`).
- * `node:path`'s `isAbsolute` only understands the current platform, so a
- * Windows-formatted address would be refused as "需要一个绝对路径" on macOS.
- * @param path - the decoded path.
- * @returns true when the Host would treat it as absolute.
- */
-function isAbsoluteWorkspacePath(path) {
-  return path.startsWith("/") || /^[A-Za-z]:[/\\]/u.test(path) || path.startsWith("\\\\");
-}
 
 /** Header a beacon must carry — same reason as the translation route's. */
 const HELLO_HEADER = "x-dsh-fast-pdf";
@@ -494,83 +483,6 @@ async function translateHandler(ctx, req, res) {
   }
 }
 
-/** The `dsh-resource://file/` grammar, as the Host writes it. */
-const FILE_ADDRESS_PREFIX = "dsh-resource://file/";
-
-/**
- * Read a file address back into a scope, a session and a path.
- *
- * Copied from the built-in document preview's own parser rather than imported:
- * what has to match is the grammar on the wire, and that is one small function.
- * A `session` path is absolute *or* relative to that session's workspace root,
- * which is exactly why the route resolves it instead of demanding absolute.
- * @param address - a candidate `dsh-resource://file/...` address.
- * @returns `{ scope, sessionId, path }`, or null when it is not one.
- */
-function parseFileAddress(address) {
-  try {
-    if (typeof address !== "string" || !address.startsWith(FILE_ADDRESS_PREFIX)) return null;
-    const cut = address.search(/[?#]/u);
-    const parts = address.slice(FILE_ADDRESS_PREFIX.length, cut === -1 ? undefined : cut).split("/");
-    const scope = parts.shift();
-    if (scope === "session") {
-      const [id, ...segments] = parts;
-      if (id === undefined || id === "" || segments.length === 0) return null;
-      return {
-        scope,
-        sessionId: decodeURIComponent(id),
-        path: segments.map((part) => decodeURIComponent(part)).join("/"),
-      };
-    }
-    if (scope === "absolute") {
-      // Match the Host's `dsh-util-workspace-path` grammar: an empty first
-      // segment with more behind it is a UNC path's `//`, a first segment like
-      // `C:` is a Windows drive, and every other POSIX path needs its leading
-      // slash put back. Without these three cases an absolute address never
-      // passes the path check and the file route answers 400.
-      const unc = parts[0] === "" && parts.length > 1;
-      const segments = (unc ? parts.slice(1) : parts).map((part) => decodeURIComponent(part));
-      if (segments.length === 0 || segments[0] === "") return null;
-      if (unc) return { scope, sessionId: "", path: `//${segments.join("/")}` };
-      const drive = /^[A-Za-z]:$/u.test(segments[0]);
-      return { scope, sessionId: "", path: drive ? segments.join("/") : `/${segments.join("/")}` };
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-/**
- * Where a session's relative paths are resolved from.
- *
- * The same answer the Host gives its own workspace reads: the session header's
- * `cwd`, then the sandbox policy's workspace root. Read through `ctx.get` so a
- * build without either service still serves absolute addresses.
- * @param ctx - plugin context.
- * @param sessionId - the session named by the address.
- * @returns an absolute directory.
- */
-function workspaceRootFor(ctx, sessionId) {
-  /** @param name - service name. @returns the service, or undefined. */
-  const read = (name) => {
-    try {
-      return typeof ctx?.get === "function" ? ctx.get(name) : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-  try {
-    const header = read("sessions")?.get?.(sessionId)?.header;
-    if (typeof header?.cwd === "string" && header.cwd !== "") return header.cwd;
-  } catch {
-    // A session that is already gone has no cwd to read; fall through.
-  }
-  const root = read("sandboxPolicy")?.workspaceRoot;
-  if (typeof root === "string" && root !== "") return root;
-  return process.cwd();
-}
-
 /**
  * Answer one file read: `{ address }` in, the file's bytes out.
  *
@@ -751,6 +663,7 @@ async function syncHandler(req, res) {
     title: payload?.title,
     address: payload?.address,
     pageCount: payload?.pageCount,
+    fingerprints: payload?.fingerprints,
     pages: payload?.pages,
     outline: payload?.outline,
     complete: payload?.complete === true,

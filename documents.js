@@ -218,10 +218,18 @@ export function writeDocument(input) {
       complete: false,
       bytes: 0,
       writtenAt: 0,
+      fingerprints: [],
     };
     documents.set(key, entry);
   }
   entry.writtenAt = Date.now();
+  // The bytes' identity, when the caller knows it. A pane and the Host can each
+  // open the same file under a different address, and without a shared token
+  // they would then occupy two slots in a session that keeps three — so the
+  // second open would evict the text the first one had already uploaded.
+  if (Array.isArray(input?.fingerprints) && fingerprintKey(input.fingerprints) !== "") {
+    entry.fingerprints = input.fingerprints;
+  }
   if (typeof title === "string" && title.trim() !== "") {
     const trimmed = title.trim();
     entry.title = trimmed.length > MAX_TITLE ? trimmed.slice(0, MAX_TITLE) : trimmed;
@@ -275,6 +283,86 @@ export function resolveDocument(sessionId, docId) {
     only = entry;
   }
   return only;
+}
+
+/**
+ * FNV-1a, seven base-36 digits.
+ *
+ * The browser half has this same function, because a `docId` has to be the same
+ * string on both sides for the pane's upload and the Host's own read to land on
+ * one entry. It is an identity, not a security boundary, so a short
+ * non-cryptographic hash is the right size for it — long enough that two
+ * manuals in one session do not collide, short enough to read in a tool call.
+ * @param text - input.
+ * @returns seven base-36 digits.
+ */
+function shortHash(text) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36).padStart(7, "0");
+}
+
+/**
+ * The identifier a document is stored under.
+ *
+ * Address plus pdf.js's fingerprints: the address names the file, and the
+ * fingerprints change when its bytes do. This must stay byte-identical to
+ * `documentIdOf` in `client.js`, or the pane and the Host would store the same
+ * document twice.
+ * @param address - the pane's file address, or the Host's resolved path.
+ * @param fingerprints - pdf.js document fingerprints, when available.
+ * @returns the docId.
+ */
+export function documentIdOf(address, fingerprints) {
+  return `d${shortHash(`${String(address)}\u0000${fingerprintKey(fingerprints)}`)}`;
+}
+
+/**
+ * The bytes' identity as one comparable string.
+ *
+ * Deliberately a plain `join`, with no normalisation: pdf.js returns
+ * `[hash, null]` — the second slot is a second fingerprint that this build does
+ * not fill in — and the browser half joins that array exactly as it stands. Any
+ * tidying here (mapping `null` to the string "null", filtering, sorting) would
+ * make the two halves disagree about the same file, and then one manual would be
+ * stored twice and evict itself from a session that keeps three documents.
+ * @param fingerprints - pdf.js fingerprints, in their raw form.
+ * @returns the identity string, or "" when there is none.
+ */
+function fingerprintKey(fingerprints) {
+  return Array.isArray(fingerprints) ? fingerprints.join(",") : "";
+}
+
+/**
+ * The document a session already holds for one file, matched by fingerprint.
+ *
+ * Two entry points reach the same file: the pane, which knows the tab's
+ * `dsh-resource://` address, and the Host reading a path itself. Their addresses
+ * differ ("session/<id>/manual.pdf" versus an absolute path), so `docId` — which
+ * is derived from the address — differs too, and the same 448-page manual would
+ * be parsed twice and stored twice in a session that keeps three documents.
+ *
+ * pdf.js's fingerprints are derived from the file's bytes, so they name the file
+ * rather than the route to it. Matching on them makes the second open extend the
+ * first instead of competing with it.
+ * @param sessionId - the calling session.
+ * @param fingerprints - the candidate file's pdf.js fingerprints.
+ * @returns the existing entry, or undefined.
+ */
+export function findByFingerprints(sessionId, fingerprints) {
+  if (typeof sessionId !== "string" || sessionId === "" || !Array.isArray(fingerprints) || fingerprints.length === 0) {
+    return undefined;
+  }
+  const wanted = fingerprintKey(fingerprints);
+  if (wanted === "") return undefined;
+  for (const entry of documents.values()) {
+    if (entry.sessionId !== sessionId) continue;
+    if (fingerprintKey(entry.fingerprints) === wanted) return entry;
+  }
+  return undefined;
 }
 
 /**

@@ -1213,6 +1213,25 @@ await check("a pane whose Host forgot the document uploads it again", async () =
   assert.match(host, /const known = resolveDocument\(sessionId, /u, "the Host answers the question");
 });
 
+await check("the pane tells the Host which file it sent, not just where", async () => {
+  // The Host can now read a PDF by path, and a path gives the same file a
+  // different `docId` than the tab's address does. Since a session keeps three
+  // documents, that made one manual occupy two slots and evict itself. The only
+  // thing the two routes share is the bytes' fingerprint, so the pane has to
+  // send it — and the Host has to store it.
+  const client = readFileSync(join(ROOT, "client.js"), "utf8");
+  assert.match(client, /fingerprints: Array\.isArray\(viewer\.pdf\?\.fingerprints\)/u,
+    "the upload must carry the bytes' identity");
+  const host = readFileSync(join(ROOT, "index.js"), "utf8");
+  assert.match(host, /fingerprints: payload\?\.fingerprints,/u, "the route must pass it to the store");
+  const store = readFileSync(join(ROOT, "documents.js"), "utf8");
+  // A plain join, because the pane joins the raw array: pdf.js returns
+  // `[hash, null]`, so any tidying in one half and not the other silently gives
+  // the same file two identities.
+  assert.match(store, /function fingerprintKey\(fingerprints\) \{\s*return Array\.isArray\(fingerprints\) \? fingerprints\.join\(","\) : "";/u,
+    "the identity must be the raw array's own join, matching the browser's");
+});
+
 await check("the document tools are named and described for a model to choose between", async () => {
   const { createTools } = await import(pathToFileURL(join(ROOT, "tools.js")).href);
   const tools = createTools({ get: () => undefined });
@@ -1221,9 +1240,12 @@ await check("the document tools are named and described for a model to choose be
     assert.ok(tool.description.length > 60, `${tool.name} needs a description a model can act on`);
     assert.doesNotMatch(tool.description, /TODO|FIXME/u);
   }
-  // The four the design settled on, and the listing that makes a second document
-  // addressable at all.
+  // The four the design settled on, plus the listing that makes a second
+  // document addressable, plus the one that removes the pane from the
+  // requirement: a conversation about "the PDF in this workspace" used to need
+  // the preview open, because only the pane ever pushed text to the Host.
   assert.deepEqual(tools.map((tool) => tool.name), [
+    "pdf_open",
     "pdf_search",
     "pdf_read_pages",
     "pdf_outline",

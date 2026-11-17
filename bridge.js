@@ -39,6 +39,18 @@ export const WORK_WAIT_MS = 20_000;
 export const CLAIM_TIMEOUT_MS = 30_000;
 
 /**
+ * How long a job waits when no pane has ever served the session.
+ *
+ * Short, but not zero: a pane starts polling the moment it mounts, so a tool
+ * called in the same second as the pane opening would otherwise be told there is
+ * no pane by a race it cannot see. One and a half seconds is long enough for the
+ * first poll to arrive and far short of the thirty seconds a silence used to
+ * cost — and since the Host can now read a file itself, "no pane" is a
+ * condition the caller can work with rather than a dead end.
+ */
+export const PANE_ABSENT_MS = 1500;
+
+/**
  * How long a tool waits for a rendered page after a pane took the job.
  *
  * Rendering one page measured at well under a second in the browser; the
@@ -75,6 +87,31 @@ const queue = new Map();
  * @type {Map<string, Set<(work: object | null) => void>>}
  */
 const pollers = new Map();
+
+/**
+ * Sessions whose pane has asked for work at least once.
+ *
+ * A page image is rendered by a browser pane, so with no pane there is nothing
+ * to render it and no reason to wait. The distinction this set draws is between
+ * "the pane has not answered yet" and "there is no pane": without it both look
+ * like silence, and the tool spends its claim deadline proving something it
+ * could have known at once.
+ * @type {Set<string>}
+ */
+const activePanes = new Set();
+
+/**
+ * Whether a pane has ever asked this session for work.
+ *
+ * "Ever", not "right now": a pane long-polls, so between two requests there is a
+ * millisecond when no request is outstanding, and treating that as absence would
+ * refuse a render the pane was about to perform.
+ * @param sessionId - the session to ask about.
+ * @returns true when a pane is known to serve this session.
+ */
+export function hasPane(sessionId) {
+  return activePanes.has(sessionId);
+}
 
 /** Monotonic job id source. */
 let nextJobId = 1;
@@ -193,9 +230,19 @@ export function requestPageImage(sessionId, request, options = {}) {
     list.push(id);
     queue.set(sessionId, list);
     if (handOff(sessionId, undefined)) return;
-    claimTimer = setTimeout(() => {
-      settle(new Error("no PDF pane is open; ask the user to open the document in the preview pane first"));
-    }, CLAIM_TIMEOUT_MS);
+    // A pane that has never asked for work is probably not there — but the first
+    // poll takes a moment to arrive, so this waits briefly instead of deciding
+    // from a snapshot. The error is tagged so the calling tool can offer the
+    // page's text rather than an exception: the caller wanted a picture, and
+    // what it can do instead depends on why there is none.
+    claimTimer = setTimeout(
+      () => {
+        const absent = new Error("no PDF pane is open for this session, so no page can be drawn");
+        absent.code = "no-pane";
+        settle(absent);
+      },
+      activePanes.has(sessionId) ? CLAIM_TIMEOUT_MS : PANE_ABSENT_MS,
+    );
     claimTimer.unref?.();
   });
 }
@@ -212,6 +259,8 @@ export function requestPageImage(sessionId, request, options = {}) {
  */
 export function takeWork(sessionId, signal) {
   if (typeof sessionId !== "string" || sessionId === "") return Promise.resolve(null);
+  // A request to do work is the proof a pane exists for this session.
+  activePanes.add(sessionId);
   const handed = [];
   handOff(sessionId, (job) => handed.push(job));
   if (handed.length > 0) return Promise.resolve(handed[0]);
@@ -286,6 +335,7 @@ export function failImage(sessionId, jobId, reason) {
  */
 export function releaseSession(sessionId) {
   queue.delete(sessionId);
+  activePanes.delete(sessionId);
   for (const [id, entry] of jobs) {
     if (entry.sessionId !== sessionId) continue;
     entry.settle(new Error("the document pane was closed"));
@@ -304,6 +354,7 @@ export function resetBridge() {
   for (const [, set] of pollers) for (const done of set) done(null);
   pollers.clear();
   queue.clear();
+  activePanes.clear();
   nextJobId = 1;
 }
 

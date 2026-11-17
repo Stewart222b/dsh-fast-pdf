@@ -22,14 +22,19 @@
  */
 import {
   MAX_QUERY,
+  documentIdOf,
   documentsForSession,
+  findByFingerprints,
   indexedPageCount,
   pageText,
   resolveDocument,
   searchDocumentText,
   searchOutline,
+  writeDocument,
 } from "./documents.js";
 import { requestPageImage } from "./bridge.js";
+import { extractPdf, resolvePdfPath } from "./extract.js";
+import { fileNameOf } from "./paths.js";
 
 /** Most pages one `pdf_read_pages` call may return. */
 const MAX_READ_PAGES = 12;
@@ -72,6 +77,20 @@ const DOCUMENT_SCHEMA = {
   },
 };
 
+/** `output.schema` for `pdf_open`, which reports what it read and from where. */
+const OPEN_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    document: DOCUMENT_SCHEMA,
+    path: { type: "string" },
+    pagesRead: { type: "integer" },
+    chars: { type: "integer" },
+    elapsedMs: { type: "integer" },
+    note: { type: "string" },
+  },
+};
+
 /**
  * What a tool reports when there is no document to read.
  *
@@ -84,7 +103,7 @@ const DOCUMENT_SCHEMA = {
 function missingDocument(sessionId) {
   const known = documentsForSession(sessionId);
   if (known.length === 0) {
-    return "No PDF has been read in this session yet. Open one in the document preview pane; its text is uploaded automatically once it has been parsed.";
+    return "No PDF has been read in this session yet. Use pdf_open with the file's path to read one — that works whether or not anything is open on screen. (Opening the document in the preview pane also works, and reads it as you read it.)";
   }
   return `No document matched. Documents read in this session: ${known
     .map((entry) => `${entry.docId} (${entry.pageCount || "?"} pages)`)
@@ -238,6 +257,77 @@ export function createTools(ctx) {
   const text = (value) => [{ type: "text", text: value }];
 
   return [
+    {
+      name: "pdf_open",
+      description:
+        "Read a PDF from disk into this conversation, by path. Use this when the user names a PDF or when a workspace contains one and the document preview pane is not open: it parses the file in the Host, so the other pdf_ tools work without anything open on screen. Accepts an absolute path, a path relative to this session's workspace, or a dsh-resource:// address. Parsing a long manual takes a second or two; asking again for a document already read is free.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          path: {
+            type: "string",
+            description:
+              "The PDF to read: an absolute path, a path relative to the workspace, or a dsh-resource://file/... address.",
+          },
+          maxPages: {
+            type: "integer",
+            description: "Stop after this many pages. Omit to read the whole document.",
+          },
+        },
+        required: ["path"],
+      },
+      output: {
+        schema: OPEN_SCHEMA,
+        render: (_args, value) => text(renderOpen(value)),
+      },
+      isConcurrencySafe: () => false,
+      async execute(args, exec) {
+        const sessionId = exec?.agent?.id;
+        if (typeof sessionId !== "string" || sessionId === "") {
+          throw new Error("this tool needs a session to read into");
+        }
+        const located = resolvePdfPath(ctx, sessionId, args?.path);
+        if (located.path === undefined) {
+          throw new Error(located.message ?? "no path given");
+        }
+        const started = Date.now();
+        const result = await extractPdf(located.path, { maxPages: args?.maxPages });
+        if (result.ok === false) throw new Error(result.message);
+
+        // One file, whichever route reached it. The pane derives its `docId`
+        // from the tab's address; this tool derives one from the resolved path,
+        // so the two disagree about the same manual. Fingerprints come from the
+        // bytes, so they agree, and matching on them lets this call extend what
+        // the pane already uploaded rather than parse a second copy.
+        const existing = findByFingerprints(sessionId, result.fingerprints);
+        const address = `dsh-resource://file/absolute${located.path.startsWith("/") ? "" : "/"}${located.path}`;
+        const docId = existing?.docId ?? documentIdOf(address, result.fingerprints);
+        const entry = writeDocument({
+          sessionId,
+          docId,
+          title: fileNameOf(located.path),
+          address,
+          pageCount: result.pageCount,
+          fingerprints: result.fingerprints,
+          pages: result.pages.map((page) => ({ pageNumber: page.pageNumber, text: page.text })),
+          outline: result.outline,
+          complete: result.truncated !== true,
+        });
+        if (entry === undefined) throw new Error("the document store refused this document");
+        const chars = result.pages.reduce((total, page) => total + page.text.length, 0);
+        return {
+          document: describe(entry),
+          path: located.path,
+          pagesRead: result.pages.length,
+          chars,
+          elapsedMs: Date.now() - started,
+          ...result.truncated === true
+            ? { note: `Read the first ${String(result.pages.length)} of ${String(result.pageCount)} pages. Ask again without maxPages for the rest.` }
+            : {},
+        };
+      },
+    },
     {
       name: "pdf_search",
       description:
@@ -544,11 +634,32 @@ export function createTools(ctx) {
             note: "No attachment store is mounted in this Host, so a page image cannot be returned.",
           };
         }
-        const { dataUrl } = await requestPageImage(
-          sessionId,
-          { pageNumber, docId: entry.docId },
-          { signal: exec.signal },
-        );
+        let dataUrl;
+        try {
+          ({ dataUrl } = await requestPageImage(
+            sessionId,
+            { pageNumber, docId: entry.docId },
+            { signal: exec.signal },
+          ));
+        } catch (error) {
+          if (error?.code !== "no-pane") throw error;
+          // A page image is drawn by the pane, and no pane is serving this
+          // session. That used to cost the model thirty seconds of silence and
+          // then a bare exception; since the Host can now read the file itself,
+          // the honest answer is "no picture, but here is the page's text".
+          const fallback = pageText(entry, pageNumber);
+          return {
+            document: describe(entry),
+            pageNumber,
+            note: [
+              `This page is drawn by the document preview pane, and no pane is open for this conversation, so page ${String(pageNumber)} cannot be rendered.`,
+              "Open the PDF in the right-hand pane to get an image.",
+              typeof fallback === "string" && fallback.trim() !== ""
+                ? `The page's text layer says:\n\n${fallback.slice(0, MAX_READ_CHARS)}`
+                : "This page has no text layer either, so nothing can be read from it until the pane is open.",
+            ].join("\n"),
+          };
+        }
         const decoded = decodeImage(dataUrl);
         if (decoded === undefined) throw new Error("the reader returned an unusable page image");
         const ref = await attachments.saveImage({
@@ -596,6 +707,31 @@ export function createTools(ctx) {
       },
     },
   ];
+}
+
+/**
+ * Render a `pdf_open` result for the model.
+ *
+ * The page count and the character count both matter: the first says how much
+ * document there is, the second says how much of it actually has a text layer. A
+ * scanned manual reports hundreds of pages and almost no characters, which is
+ * the difference between "read this and answer" and "this needs looking at as
+ * images".
+ * @param value - the canonical value.
+ * @returns the text block body.
+ */
+function renderOpen(value) {
+  const title = value.document?.title ?? value.path;
+  const pages = String(value.document?.pageCount ?? 0);
+  const read = String(value.pagesRead ?? 0);
+  const head = `${title} — ${read === pages ? `${pages} pages` : `${read} of ${pages} pages`}, ${String(value.chars ?? 0).replace(/\B(?=(\d{3})+(?!\d))/gu, ",")} characters, read in ${String(value.elapsedMs ?? 0)} ms`;
+  const thin = value.pagesRead > 0 && (value.chars ?? 0) < value.pagesRead * 40;
+  const lines = [head];
+  if (thin) {
+    lines.push("There is very little text for this many pages, so the pages are probably scans or images: use pdf_page_image to look at one.");
+  }
+  if (value.note !== undefined) lines.push(value.note);
+  return lines.join("\n");
 }
 
 /**

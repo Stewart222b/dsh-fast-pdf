@@ -307,6 +307,7 @@ console.log("tools");
 await check("every tool declares a render and a supported schema", async () => {
   const tools = createTools({ get: () => undefined });
   assert.deepEqual(tools.map((tool) => tool.name), [
+    "pdf_open",
     "pdf_search",
     "pdf_read_pages",
     "pdf_outline",
@@ -332,6 +333,10 @@ await check("no document open is an answer, not an exception", async () => {
   assert.equal(rendered.length, 1);
   assert.equal(rendered[0].type, "text");
   assert.match(rendered[0].text, /No PDF has been read/u, "the note is what the model reads");
+  // What the model does next decides whether a session without a pane works at
+  // all. "Open the pane" is advice it cannot follow on the user's behalf; naming
+  // the tool that reads a path itself is advice it can act on.
+  assert.match(value.note, /pdf_open/u, "the way out has to name a tool the model can call");
 });
 
 await check("search renders page numbers the model can cite", async () => {
@@ -445,6 +450,142 @@ await check("page_image refuses a page past the end", async () => {
   const tools = createTools({ get: () => undefined });
   const image = tools.find((tool) => tool.name === "pdf_page_image");
   await assert.rejects(() => image.execute({ page: 7 }, exec("s-1")), /past the end/u);
+});
+
+console.log("reading a file from the Host");
+
+/** The samples the browser tests already ship, so nothing new is committed. */
+const SAMPLE = join(ROOT, "tests/browser/samples");
+
+/** A context whose model can see images, so `pdf_page_image` gets past the check. */
+const seeingCtx = {
+  get: (name) => {
+    if (name === "llm") {
+      return {
+        resolveModelInfo: async () => ({ inputModalities: ["text", "image"] }),
+      };
+    }
+    if (name === "attachments") {
+      return {
+        saveImage: async ({ mediaType }) => ({ attachmentId: "att-1", mediaType, bytes: 4, width: 8, height: 8 }),
+      };
+    }
+    return undefined;
+  },
+};
+
+await check("pdf_open reads a PDF with no pane anywhere", async () => {
+  store.resetDocuments();
+  bridge.resetBridge();
+  const tools = createTools(seeingCtx);
+  const open = tools.find((tool) => tool.name === "pdf_open");
+  const value = await open.execute({ path: join(SAMPLE, "plain.pdf") }, exec("s-1"));
+  assert.equal(value.document.pageCount, 4);
+  assert.equal(value.pagesRead, 4);
+  assert.ok(value.chars > 500, `expected a real text layer, got ${value.chars} characters`);
+  assert.equal(value.document.title, "plain.pdf");
+  const body = open.output.render({}, value)[0].text;
+  assert.match(body, /plain\.pdf/u);
+  assert.match(body, /4 pages/u);
+  // The point of the whole exercise: the other tools now answer, with no pane.
+  const read = tools.find((tool) => tool.name === "pdf_read_pages");
+  const pages = await read.execute({ pages: "1" }, exec("s-1"));
+  assert.match(pages.pages[0].text, /Lorem ipsum/u);
+});
+
+await check("pdf_open resolves a path relative to the workspace", async () => {
+  store.resetDocuments();
+  const tools = createTools(seeingCtx);
+  const open = tools.find((tool) => tool.name === "pdf_open");
+  // The workspace root comes from the sandbox policy; without one the Host falls
+  // back to its own cwd, so this runs from the repository it lives in.
+  const value = await open.execute({ path: "tests/browser/samples/b-short.pdf" }, exec("s-1"));
+  assert.equal(value.document.title, "b-short.pdf");
+  assert.equal(value.document.pageCount, 2);
+});
+
+await check("the same file reached two ways is one document", async () => {
+  store.resetDocuments();
+  const tools = createTools(seeingCtx);
+  const open = tools.find((tool) => tool.name === "pdf_open");
+  const absolute = join(SAMPLE, "plain.pdf");
+  const first = await open.execute({ path: absolute }, exec("s-1"));
+  // A pane derives its docId from the tab's address, which is not this path.
+  // Fingerprints come from the bytes, so they are the only thing that can tell
+  // these two routes apart from two different files.
+  const second = await open.execute({ path: absolute.replace(/\.pdf$/u, ".pdf") === absolute ? `${SAMPLE}/./plain.pdf` : absolute }, exec("s-1"));
+  assert.equal(second.document.docId, first.document.docId, "one file must not become two documents");
+  assert.equal(store.documentsForSession("s-1").length, 1, "and must not take two of the three slots");
+});
+
+await check("a pane's upload and the Host's read land on one document", async () => {
+  store.resetDocuments();
+  const { extractPdf } = await import(pathToFileURL(join(ROOT, "extract.js")).href);
+  const absolute = join(SAMPLE, "plain.pdf");
+  const parsed = await extractPdf(absolute, { maxPages: 1 });
+  // What the pane sends: its own address, its own docId, its fingerprints.
+  const paneAddress = "dsh-resource://file/session/s-1/plain.pdf";
+  const paneId = store.documentIdOf(paneAddress, parsed.fingerprints);
+  store.writeDocument({
+    sessionId: "s-1",
+    docId: paneId,
+    title: "plain.pdf",
+    address: paneAddress,
+    pageCount: 4,
+    fingerprints: parsed.fingerprints,
+    pages: [{ pageNumber: 1, text: "from the pane" }],
+    complete: false,
+  });
+  const tools = createTools(seeingCtx);
+  const value = await tools.find((tool) => tool.name === "pdf_open").execute({ path: absolute }, exec("s-1"));
+  assert.equal(value.document.docId, paneId, "the Host must recognise the file the pane already sent");
+  assert.equal(store.documentsForSession("s-1").length, 1);
+});
+
+await check("a password-protected file is refused in a sentence", async () => {
+  store.resetDocuments();
+  const tools = createTools(seeingCtx);
+  await assert.rejects(
+    () => tools.find((tool) => tool.name === "pdf_open").execute({ path: join(SAMPLE, "pw-aes.pdf") }, exec("s-1")),
+    /password/iu,
+  );
+});
+
+await check("a missing file says so instead of throwing a stack", async () => {
+  store.resetDocuments();
+  const tools = createTools(seeingCtx);
+  await assert.rejects(
+    () => tools.find((tool) => tool.name === "pdf_open").execute({ path: join(SAMPLE, "no-such-file.pdf") }, exec("s-1")),
+    /No such file/u,
+  );
+});
+
+await check("page_image offers text when no pane can draw the page", async () => {
+  store.resetDocuments();
+  bridge.resetBridge();
+  seed("d-nopane", 3, (page) => `the text of page ${page}`);
+  const tools = createTools(seeingCtx);
+  const image = tools.find((tool) => tool.name === "pdf_page_image");
+  const started = Date.now();
+  // The bridge unrefs its own timers so a quiet Host can exit; in a bare test
+  // process that would let the loop drain with this promise still pending, so
+  // the wait is held by a referenced timer of our own.
+  // Sized for the regression, not the happy path: this has to keep the process
+  // alive long enough for the assertion to be the thing that fails, rather than
+  // letting Node drain with the promise pending. It is cleared as soon as the
+  // call returns, so the normal case costs nothing.
+  const keeper = setTimeout(() => {}, bridge.CLAIM_TIMEOUT_MS + 2000);
+  const value = await image.execute({ page: 2 }, exec("s-1"));
+  clearTimeout(keeper);
+  const elapsed = Date.now() - started;
+  assert.equal(value.image, undefined);
+  assert.match(value.note, /no pane is open/u);
+  assert.match(value.note, /the text of page 2/u, "the page's text is the useful answer when it cannot be drawn");
+  // The old behaviour waited out the full claim deadline — measured at 30,002 ms
+  // before this changed, against 1,502 ms after. Comparing against
+  // `CLAIM_TIMEOUT_MS` would have proved nothing, since that is the number the
+  // regression itself produces; this bound is between the two.
+  assert.ok(elapsed < 5000, `waited ${elapsed} ms, so it sat out a deadline instead of noticing there is no pane`);
 });
 
 console.log("page image bridge");
@@ -690,7 +831,7 @@ await check("the tools reach the Host through apply", async () => {
     webServer: { register: (route) => { routes.push(route); return () => {}; } },
     log: () => {},
   });
-  assert.deepEqual(registered, ["pdf_search", "pdf_read_pages", "pdf_outline", "pdf_page_image", "pdf_list"]);
+  assert.deepEqual(registered, ["pdf_open", "pdf_search", "pdf_read_pages", "pdf_outline", "pdf_page_image", "pdf_list"]);
 });
 
 await check("a Host without a tool service still gets its routes", async () => {

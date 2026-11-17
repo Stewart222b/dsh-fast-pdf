@@ -62,6 +62,39 @@ window.__ModuleLoader__.load({
      * checked on both halves — is the real ceiling.
      */
     const MAX_PDF_BYTES = 256 * 1024 * 1024;
+    /**
+     * How long a whole-file read may go without progress before it counts as
+     * stalled.
+     *
+     * A read of a 35 MB file over a local route begins streaming within a
+     * second, so eight seconds of complete silence means that request is not
+     * coming back. The pane then abandons it and asks again — see
+     * `READ_STALL_RETRIES` — because a request lost in the transport should cost
+     * the reader a few seconds, not a page reload.
+     *
+     * This is a lack-of-progress timer, not a total-time deadline: every byte
+     * count re-arms it, so a large file that keeps streaming is never touched no
+     * matter how long it takes.
+     */
+    const READ_STALL_MS = 8000;
+    /**
+     * How many times a silent read is retried before the pane gives up.
+     *
+     * One retry covers the transport hiccup that a reader would otherwise fix by
+     * closing and reopening the tab. More than one would just multiply the wait
+     * before the same message.
+     */
+    const READ_STALL_RETRIES = 1;
+    /**
+     * Which build of this bundle is running in the page.
+     *
+     * Every report carries it, stamped once inside `beacon()`. Reports used to
+     * describe what happened without saying which code was asking, and that
+     * mattered: a pane mounted on 11-17 09:43 ran a bundle older than the
+     * `body-read` reports, so their absence was evidence about the build, not
+     * about the read. One central stamp means no report can omit it again.
+     */
+    const BUILD = "2026-11-17-body-read-reports-v16";
     /** Scheme every workspace-file address opens with. */
     const FILE_PREFIX = "dsh-resource://file/";
 
@@ -177,6 +210,7 @@ window.__ModuleLoader__.load({
       passwordCancel: "取消",
       passwordCancelled: "没有输入密码，PDF 没有打开",
       readUnavailable: "这个宿主版本没有开放文件读取，打不开这个文件",
+      readStalled: "这个文件一直没读出来。可以在右侧面板里关掉它再打开一次；如果反复这样，就是宿主这条读取通路卡住了",
       tooLarge: "这个 PDF 超过了能打开的大小上限",
       selectionTooLong: "选中的内容太多了，一次最多翻译 {count} 个字符",
       pageNumber: "页码",
@@ -274,6 +308,7 @@ window.__ModuleLoader__.load({
       passwordCancel: "Cancel",
       passwordCancelled: "No password was entered, so the PDF stayed closed",
       readUnavailable: "This host build does not expose file reads, so this file cannot be opened",
+      readStalled: "This file never finished loading. Close it in the pane and open it again; if that keeps happening, the host reading route is stuck",
       tooLarge: "This PDF is larger than the size this viewer will open",
       selectionTooLong: "That is too much to translate at once — {count} characters at most",
       pageNumber: "Page number",
@@ -507,6 +542,12 @@ window.__ModuleLoader__.load({
         const payload = {
           kind,
           id: PREVIEW_ID,
+          // Which build is asking, on every report. A report that does not name
+          // its build cannot be told apart from a report its build never learned
+          // to make: the 11-17 pane's missing `body-read` lines meant "that
+          // page ran older code", not "the read never ran", and nothing in the
+          // record said so. Stamped centrally so no future report can omit it.
+          build: BUILD,
           path: String(document.baseURI ?? ""),
           pageAt: Math.round(Number(globalThis.performance?.timeOrigin ?? 0)),
           at: Date.now(),
@@ -1051,6 +1092,12 @@ window.__ModuleLoader__.load({
               title,
               address: String(address),
               pageCount,
+              // The bytes' identity, so the Host can recognise the same file
+              // when it reaches it by a different route — its own `pdf_open`
+              // resolves a path, not this tab's address, and the two addresses
+              // give the same document two `docId`s. Without this the Host would
+              // store one manual twice and push it out of its own three slots.
+              fingerprints: Array.isArray(viewer.pdf?.fingerprints) ? viewer.pdf.fingerprints : [],
               pages: batch,
               ...(withOutline ? { outline: rows } : {}),
               complete: false,
@@ -1783,7 +1830,20 @@ window.__ModuleLoader__.load({
         if (typeof retainTab === "function" && tabId !== undefined) retainTab(tabId, tabSignal);
       }, [retainTab, tabId, tabSignal]);
       React.useEffect(() => {
-        beacon("mount", { mounted: true });
+        // What this mount was handed, because "it mounted" was all this used to
+        // say and that was not enough to tell two very different panes apart: a
+        // body with a handle to read through, and a body with nothing. The
+        // second one stayed blank for its whole life and the report looked
+        // identical. `content` being absent is a fact worth recording on the
+        // one line every mount is guaranteed to emit.
+        beacon("mount", {
+          mounted: true,
+          session: String(props.sessionId ?? ""),
+          address: String(props.resourceAddress ?? "").slice(0, 120),
+          hasContent: content !== undefined,
+          contentKind: String(content?.kind ?? ""),
+          read: typeof props.readBytes,
+        });
       }, []);
       // A popover closes on the next press anywhere else — the usual bargain, and
       // the reason the ⋯ menu needs no full-screen backdrop over the page.
@@ -2860,16 +2920,50 @@ window.__ModuleLoader__.load({
 
       const revision = rendererContent === undefined ? undefined : rendererContent.revision;
       React.useEffect(() => {
-        if (rendererContent === undefined) return undefined;
+        // Read by address, and stop gating that read on the Host's handle.
+        //
+        // The gate was `if (rendererContent === undefined) return undefined;`
+        // and it was a silent return, which is the shape of failure this pane
+        // has produced repeatedly: a body that mounts, renders an empty frame,
+        // uploads nothing, and says nothing about why. Reading needs the
+        // address; the handle only carries `loaded()`, which reports progress
+        // back to the Host and is genuinely optional. So the address decides,
+        // and the handle is used if it happens to be there.
+        //
+        // This is not a diagnosis of the 11-17 09:43 pane. That mount emitted
+        // `mount` and nothing else, and `mount` can only fire from a body the
+        // Host rendered — the Host renders this slot only when its `content` is
+        // defined (`content !== void 0 && renderSlot(...)`), and with
+        // `loading: "renderer"` any defined `content` has kind `renderer`. So
+        // the handle was there and the gate did not fire. What the reports
+        // cannot show is a read that started and was abandoned, because an
+        // aborted read left no trace at all — see `body-read` below, which is
+        // the part of this change that would actually have caught it.
         const read = props.readBytes;
+        const address = String(props.resourceAddress ?? "");
+        // Every way out of this effect is reported. Until now the exits were
+        // silent, so a pane that mounted and then did nothing produced exactly
+        // one report — `mount` — and no way to tell which exit it took. The
+        // `enter` line is what makes the empty case legible: if a mount is
+        // followed by `enter` and nothing else, the effect ran and returned
+        // early; if `enter` never arrives, the effect never committed.
+        beacon("body-read", {
+          phase: "enter",
+          address: address.slice(0, 120),
+          hasContent: rendererContent !== undefined,
+          read: typeof read,
+          inline: inlineBytes === undefined ? "-" : "bytes",
+        });
+        if (address === "" || inlineBytes !== undefined) return undefined;
         if (typeof read !== "function") {
           setFailure(copy.current("readUnavailable"));
           setStatus("failed");
           return undefined;
         }
-        const address = String(props.resourceAddress ?? "");
         const controller = new AbortController();
         let done = false;
+        /** Bytes reported by the last progress tick, for the abort report. */
+        let readSoFar = 0;
         // Already open in this page: there is nothing to read. The viewer (and
         // its bitmaps and text index) is waiting in the cache, so a switch back
         // is a re-attach rather than a reload. Asked *before* the loading paint:
@@ -2882,67 +2976,179 @@ window.__ModuleLoader__.load({
           setBytes(parked.bytes);
           setSourceAddress(address);
           bytesVersionRef.current = parked.version ?? 1;
-          rendererContent.loaded?.(parked.version ?? 1);
+          rendererContent?.loaded?.(parked.version ?? 1);
           return undefined;
         }
         setStatus("loading");
         setFailure("");
         setProgress(null);
         loadingPhase.current = "download";
-        read(props.resourceAddress, controller.signal, (ratio, counts) => {
-          if (done) return;
-          // The layout took over: a byte count that arrives now is the tail of
-          // the read, and painting it would push the bar back to full.
-          if (loadingPhase.current !== "download") return;
-          const known = Number(counts?.total) || 0;
-          const own = Math.max(0, Math.min(1, Number(ratio) || 0));
-          const loaded = Number(counts?.loaded) || 0;
-          setProgress((previous) => {
-            if (previous?.phase === "prepare") return previous;
-            const floor = Number(previous?.percent) || 0;
-            // Same rule as the viewer own counts: bytes fill the bar up to 95,
-            // the layout carries the rest, so it never has to walk backwards.
-            const percent = known > 0 ? Math.min(95, Math.max(floor, own * 100)) : floor;
-            return { loaded, total: known, ratio: known > 0 ? own : null, percent, phase: "download" };
-          });
-        })
-          .then((result) => {
+        // A read that starts and never finishes used to leave nothing behind at
+        // all: cleanup set `done` before aborting, so neither the `then` nor the
+        // `catch` below could run, and the pane sat on its opening bar forever
+        // with no report to say it had even begun. The start and the two ways
+        // out are reported so a stalled read is visible instead of inferred.
+        beacon("body-read", { phase: "start", address: address.slice(0, 120) });
+        // A request that never answers is the one failure mode the reports could
+        // not distinguish from a request that was never made: no `then`, no
+        // `catch`, no cleanup, just a pane on its opening bar.
+        //
+        // This is a lack-of-progress watchdog, not a total-time deadline: every
+        // progress tick re-arms it, so a 35 MB read that keeps streaming is
+        // never touched no matter how long it takes. Only silence trips it.
+        let stallTimer = 0;
+        let stalls = 0;
+        /** Abandons the current attempt so a fresh one can start. */
+        let abandon = () => {};
+        /** Starts an attempt; bound below, once the attempt exists. */
+        let startAttempt = () => {};
+        const armStall = () => {
+          clearTimeout(stallTimer);
+          stallTimer = setTimeout(() => {
             if (done) return;
-            done = true;
-            // The byte count stays on screen until the layout reports its own:
-            // clearing it here is what put an indeterminate "正在排版…" between a
-            // full bar and the page count (measured: 100% → blank → 95% on a
-            // 35 MB file).
-            setBytes(result.bytes);
-            setSourceAddress(address);
-            bytesVersionRef.current = result.version ?? 1;
-            beacon("body-bytes", { bytes: result.bytes.byteLength, version: result.version });
-            // `hasContent` in the pane is `version !== undefined`, so a renderer
-            // body that never reports one leaves the tab looking unfinished.
-            // The value itself is not compared against anything the Host
-            // measured — it stops measuring once the body reads for itself.
-            rendererContent.loaded?.(result.version ?? 1);
-          })
-          .catch((error) => {
-            if (done) return;
-            done = true;
+            stalls += 1;
+            beacon("body-read", {
+              phase: "stall",
+              bytes: Number(readSoFar) || 0,
+              attempt: stalls,
+              address: address.slice(0, 120),
+            });
+            // Retry once before giving up on the pane. A read that goes quiet is
+            // usually a request that died somewhere in the transport, and asking
+            // again is what a reader would do by closing and reopening the tab —
+            // except they should not have to, because the second try needs no
+            // page reload and no lost reading position.
+            if (stalls <= READ_STALL_RETRIES) {
+              abandon();
+              startAttempt();
+              return;
+            }
+            // Still quiet after the retries: say so where the reader can see it,
+            // and stop holding a connection for a pane that has given up.
             setProgress(null);
-            setFailure(
-              error?.code === "too-large"
-                ? `${copy.current("tooLarge")} · ${humanSize(Number(error.size ?? 0))}`
-                : String(error?.message ?? error),
-            );
+            setFailure(copy.current("readStalled"));
             setStatus("failed");
-          });
+            done = true;
+            controller.abort();
+          }, READ_STALL_MS);
+          stallTimer.unref?.();
+        };
+        /**
+         * One attempt at reading the whole file.
+         *
+         * A retry needs its own controller: once a signal is aborted it stays
+         * aborted, so the abandoned request and the fresh one cannot share one.
+         * `stalls` at the moment this attempt starts is what tells the failure
+         * handler whether a rejection is an error or our own watchdog cutting
+         * this attempt short in order to try again.
+         */
+        const attemptRead = () => {
+          const attempt = new AbortController();
+          const mine = stalls;
+          const onOuterAbort = () => attempt.abort();
+          controller.signal.addEventListener("abort", onOuterAbort, { once: true });
+          const detach = () => controller.signal.removeEventListener("abort", onOuterAbort);
+          abandon = () => attempt.abort();
+          readSoFar = 0;
+          // Arm before the first byte: a retry that hangs immediately has to be
+          // watched too, or the second silence would be the one nobody reports.
+          armStall();
+          read(props.resourceAddress, attempt.signal, (ratio, counts) => {
+            if (done) return;
+            // Bytes are moving, so the read is alive: push the watchdog out.
+            // Done before the paint gate below, because a read that has handed
+            // over to the layout is still a read that must not be called
+            // stalled.
+            armStall();
+            // The layout took over: a byte count that arrives now is the tail
+            // of the read, and painting it would push the bar back to full.
+            if (loadingPhase.current !== "download") return;
+            const known = Number(counts?.total) || 0;
+            const own = Math.max(0, Math.min(1, Number(ratio) || 0));
+            const loaded = Number(counts?.loaded) || 0;
+            readSoFar = loaded;
+            setProgress((previous) => {
+              if (previous?.phase === "prepare") return previous;
+              const floor = Number(previous?.percent) || 0;
+              // Same rule as the viewer own counts: bytes fill the bar up to
+              // 95, the layout carries the rest, so it never has to walk
+              // backwards.
+              const percent = known > 0 ? Math.min(95, Math.max(floor, own * 100)) : floor;
+              return { loaded, total: known, ratio: known > 0 ? own : null, percent, phase: "download" };
+            });
+          })
+            .then((result) => {
+              clearTimeout(stallTimer);
+              detach();
+              if (done) return;
+              done = true;
+              // The byte count stays on screen until the layout reports its
+              // own: clearing it here is what put an indeterminate "正在排版…"
+              // between a full bar and the page count (measured: 100% → blank
+              // → 95% on a 35 MB file).
+              setBytes(result.bytes);
+              setSourceAddress(address);
+              bytesVersionRef.current = result.version ?? 1;
+              beacon("body-bytes", { bytes: result.bytes.byteLength, version: result.version });
+              // `hasContent` in the pane is `version !== undefined`, so a
+              // renderer body that never reports one leaves the tab looking
+              // unfinished. The value itself is not compared against anything
+              // the Host measured — it stops measuring once the body reads for
+              // itself.
+              rendererContent?.loaded?.(result.version ?? 1);
+            })
+            .catch((error) => {
+              detach();
+              if (done) return;
+              // Our own watchdog cut this attempt short. The retry was already
+              // started when it did, so reporting this rejection as a failure
+              // would put an error card over a read that is running again.
+              if (stalls > mine && stalls <= READ_STALL_RETRIES) return;
+              clearTimeout(stallTimer);
+              done = true;
+              setProgress(null);
+              beacon("body-read", { phase: "fail", code: String(error?.code ?? "") });
+              setFailure(
+                error?.code === "too-large"
+                  ? `${copy.current("tooLarge")} · ${humanSize(Number(error.size ?? 0))}`
+                  : String(error?.message ?? error),
+              );
+              setStatus("failed");
+            });
+        };
+        // The watchdog needs to start the next attempt, and the watchdog is
+        // armed before this function exists: bind it through a variable rather
+        // than closing over a `const` that is still in its temporal dead zone.
+        startAttempt = () => attemptRead();
+        attemptRead();
         return () => {
+          // An abort is the one exit that used to be invisible. Report it with
+          // whether any bytes had arrived, because "the read was cancelled" and
+          // "the read never got going" lead to different causes: a remount
+          // storm versus a route that answers slowly.
+          clearTimeout(stallTimer);
+          if (!done) beacon("body-read", { phase: "abort", bytes: Number(readSoFar) || 0 });
           done = true;
           controller.abort();
         };
-      }, [revision, rendererContent === undefined, props.readBytes, props.resourceAddress]);
+      }, [revision, props.readBytes, props.resourceAddress]);
 
       React.useEffect(() => {
         const frame = frameRef.current;
-        if (frame === null || bytes === undefined) return undefined;
+        if (frame === null || bytes === undefined) {
+          // The second silent exit, and the one that decides whether a document
+          // ever reaches the conversation: nothing below here builds the viewer,
+          // and nothing below here uploads a page either.
+          //
+          // Only a missing frame is reported. `bytes === undefined` is the
+          // normal first render — the read effect has not delivered yet — so
+          // reporting it would put a line in the log for every healthy open and
+          // make the log ambiguous again. A null frame is never normal: it means
+          // the ref was not bound, so nothing can be built however the read
+          // goes.
+          if (frame === null) beacon("body-server", { phase: "no-frame" });
+          return undefined;
+        }
         let disposed = false;
         let viewer = null;
         let resizeObserver = null;
@@ -2977,7 +3183,10 @@ window.__ModuleLoader__.load({
           // and there was no way to tell which of the two inputs was missing.
           // This is the only place that knows, so it says so.
           if (sessionId === "" || address === "") {
-            beacon("serve-skip", { session: sessionId === "" ? "missing" : "ok", address: address === "" ? "missing" : "ok" });
+            beacon("serve-skip", {
+              session: sessionId === "" ? "missing" : "ok",
+              address: address === "" ? "missing" : "ok",
+            });
             return;
           }
           const text = startTextSync({
