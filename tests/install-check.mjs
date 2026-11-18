@@ -104,9 +104,12 @@ try {
 const packageDir = dirname(packageJsonPath);
 check("the package resolves from the profile", true, packageDir);
 
-// 3. A dev install is a link; say so, because editing the profile's copy of the
-//    files is then editing this repository. Node resolves the link away, so the
-//    entry itself has to be looked at with `lstat`.
+// 3. How this copy got here, which decides what an edit means. A dev install is
+//    a link to a checkout, so editing the profile's copy is editing that
+//    repository; an install from a tarball or the registry is a plain copy, so a
+//    source edit needs a reinstall. Both are legitimate — the distinction is
+//    reported, not graded. Node resolves a link away, so `lstat` is the only way
+//    to see it.
 const linkPath = join(profileDir, "node_modules", PACKAGE);
 let linkKind = "missing";
 try {
@@ -115,9 +118,11 @@ try {
   /* keep "missing" */
 }
 check(
-  "the install is a link, not a copy",
-  linkKind === "link",
-  linkKind === "copy" ? "a copied install — a source edit needs a reinstall" : packageDir,
+  "the install resolves to a real directory",
+  linkKind !== "missing",
+  linkKind === "link"
+    ? `a link to ${packageDir} — editing it edits that checkout`
+    : `a copy at ${packageDir} — a source edit needs a reinstall`,
 );
 
 // 4. The shell asks for `<package>/client`; the host half is the package root.
