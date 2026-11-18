@@ -110,13 +110,18 @@ export function workspaceRootFor(ctx, sessionId) {
  * bytes, which is what made every document in a conversation carry that name.
  * The last segment of the path always ends in the real file name, and that is
  * what a person recognises in a citation.
+ *
+ * Both separators count. A path the Host resolved arrives in the platform's own
+ * spelling, and on Windows that is `C:\work\a.pdf`: splitting on `/` alone
+ * leaves the whole path as the "file name", which is how every document opened
+ * by path came to be titled with its full location.
  * @param target - a path or a `dsh-resource://` address.
  * @returns the decoded last segment, or "".
  */
 export function fileNameOf(target) {
   const text = String(target ?? "");
   const cut = text.search(/[?#]/u);
-  const parts = text.slice(0, cut === -1 ? undefined : cut).split("/");
+  const parts = text.slice(0, cut === -1 ? undefined : cut).split(/[\\/]/u);
   const last = parts[parts.length - 1] ?? "";
   try {
     return decodeURIComponent(last);
