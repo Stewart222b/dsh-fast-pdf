@@ -1,0 +1,54 @@
+<svg width="640" height="300" viewBox="0 0 640 300" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Fast PDF in the right sidebar: pages scroll as one column, an outline floats over them, and a translation bubble follows the selected passage</title>
+
+  <!-- The PDF column: pages scroll as one continuous document -->
+  <rect x="228" y="32" width="240" height="236" rx="10" fill="#FFFFFF" stroke="#C2CBD9" stroke-width="2" />
+
+  <!-- Toolbar strip -->
+  <path d="M228 42a10 10 0 0 1 10-10h220a10 10 0 0 1 10 10v24H228z" fill="#F2F5FA" />
+  <path d="M238 32h220a10 10 0 0 1 10 10v24H228V42a10 10 0 0 1 10-10z" stroke="#D8DFE9" stroke-width="2" />
+  <rect x="244" y="44" width="36" height="8" rx="4" fill="#B9C4D5" />
+  <rect x="292" y="44" width="18" height="8" rx="4" fill="#C8D2E0" />
+  <rect x="320" y="44" width="18" height="8" rx="4" fill="#C8D2E0" />
+  <rect x="348" y="44" width="18" height="8" rx="4" fill="#C8D2E0" />
+  <circle cx="444" cy="48" r="5" fill="#D3DCE8" />
+
+  <!-- Page one, scrolled up out of the reading position -->
+  <rect x="244" y="72" width="208" height="84" rx="4" fill="#FBFCFE" stroke="#E0E6EF" stroke-width="2" />
+  <rect x="258" y="84" width="120" height="7" rx="3.5" fill="#CBD5E3" />
+  <rect x="258" y="100" width="180" height="5" rx="2.5" fill="#E4EAF2" />
+  <rect x="258" y="112" width="164" height="5" rx="2.5" fill="#E4EAF2" />
+  <rect x="258" y="124" width="176" height="5" rx="2.5" fill="#E4EAF2" />
+  <rect x="258" y="136" width="132" height="5" rx="2.5" fill="#E4EAF2" />
+
+  <!-- Page two, the page being read -->
+  <rect x="244" y="170" width="208" height="90" rx="4" fill="#FFFFFF" stroke="#CBD4E1" stroke-width="2" />
+  <rect x="258" y="184" width="180" height="5" rx="2.5" fill="#DDE4EE" />
+
+  <!-- The selected passage, inside the text it was taken from -->
+  <rect x="258" y="206" width="136" height="8" rx="3" fill="#9CC2FF" fill-opacity="0.75" />
+  <rect x="258" y="220" width="100" height="8" rx="3" fill="#9CC2FF" fill-opacity="0.6" />
+
+  <rect x="258" y="234" width="174" height="5" rx="2.5" fill="#E4EAF2" />
+  <rect x="258" y="246" width="112" height="5" rx="2.5" fill="#E4EAF2" />
+
+  <!-- Scroll thumb: one long document, not discrete pages -->
+  <rect x="450" y="78" width="6" height="82" rx="3" fill="#C2CBD9" />
+
+  <!-- Translation bubble, anchored at the focused end of the selection -->
+  <path d="M70 164a10 10 0 0 1 10-10h136a10 10 0 0 1 10 10v72a10 10 0 0 1-10 10H80a10 10 0 0 1-10-10z" fill="#FFFFFF" stroke="#C2CBD9" stroke-width="2" />
+  <path d="M226 198l26 12-26 12z" fill="#FFFFFF" stroke="#C2CBD9" stroke-width="2" stroke-linejoin="round" />
+  <path d="M224 200h4v20h-4z" fill="#FFFFFF" />
+  <rect x="88" y="176" width="88" height="8" rx="4" fill="#2F55D8" />
+  <rect x="88" y="194" width="128" height="6" rx="3" fill="#DDE4EE" />
+  <rect x="88" y="208" width="112" height="6" rx="3" fill="#DDE4EE" />
+  <rect x="88" y="222" width="86" height="6" rx="3" fill="#DDE4EE" />
+
+  <!-- Outline, floating over the page instead of squeezing it -->
+  <rect x="486" y="72" width="122" height="106" rx="8" fill="#FFFFFF" stroke="#C2CBD9" stroke-width="2" />
+  <rect x="500" y="88" width="72" height="6" rx="3" fill="#B9C4D5" />
+  <rect x="512" y="104" width="60" height="6" rx="3" fill="#E4EAF2" />
+  <rect x="500" y="120" width="80" height="6" rx="3" fill="#2F55D8" />
+  <rect x="512" y="136" width="52" height="6" rx="3" fill="#E4EAF2" />
+  <rect x="500" y="152" width="66" height="6" rx="3" fill="#E4EAF2" />
+</svg>

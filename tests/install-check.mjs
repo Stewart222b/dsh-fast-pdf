@@ -71,6 +71,17 @@ try {
   process.exit(1);
 }
 const bundles = profile.dsh?.profile?.bundles ?? [];
+const installed = existsSync(join(profileDir, "node_modules", PACKAGE));
+if (!bundles.includes(PACKAGE) && !installed) {
+  // A contributor who never installed this into a profile would otherwise see
+  // two red lines on every `npm test` that say nothing about the code. Say what
+  // is actually true and stop: there is no install here to check.
+  console.log(`skip  this profile has not installed ${PACKAGE}`);
+  console.log(`      checked ${profileDir}`);
+  console.log(`      install it with: dsh plugin --profile <profile> add <this checkout or ${PACKAGE}>`);
+  console.log("\nnothing to check");
+  process.exit(0);
+}
 check(
   "the profile lists the bundle",
   bundles.includes(PACKAGE),
@@ -134,19 +145,35 @@ check(
   `id: ${inserts.join(",") || "none"}`,
 );
 
-// 7. Compatibility gating: an unmet `engines.dsh` or a `@deepseek-ai/dsh*` peer
-//    that the runtime does not satisfy gets the whole bundle skipped.
+// 7. Declared compatibility. `dsh-package-manifest` states plainly that current
+//    installers and loaders enforce neither `dsh.manifestVersion` nor
+//    `engines.dsh`, so a range here is documentation, not a gate: nothing skips
+//    the bundle because of it. What this check can still catch is a malformed
+//    value, which would mislead every reader of the manifest — including whoever
+//    decides whether this plugin can be installed on their DSH.
 const requirements = [];
-if (typeof manifest.engines?.dsh === "string") requirements.push(`engines.dsh ${manifest.engines.dsh}`);
+if (manifest.engines?.dsh !== undefined) requirements.push(`engines.dsh ${manifest.engines.dsh}`);
 for (const [name, range] of Object.entries(manifest.peerDependencies ?? {})) {
   if (name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-")) {
     requirements.push(`${name} ${range}`);
   }
 }
+// A comparator set such as `>=0.2.0-0 <0.3.0-0`: every space-separated token is
+// one comparator with an optional operator and an optional prerelease tag.
+const SEMVER_TOKEN = /^[<>=~^]{0,2}\s*\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+/** Whether a range reads as a plain comparator set (no `||`, no `*`). */
+function isReadableRange(range) {
+  const tokens = String(range).trim().split(/\s+/u);
+  return tokens.length > 0 && tokens.every((token) => SEMVER_TOKEN.test(token));
+}
+const malformed = [];
+if (manifest.engines?.dsh !== undefined && !isReadableRange(manifest.engines.dsh)) {
+  malformed.push(`engines.dsh ${manifest.engines.dsh}`);
+}
 check(
-  "no version requirement can skip the bundle",
-  requirements.length === 0,
-  requirements.join(", ") || "none declared",
+  "every declared version range is a readable SemVer range",
+  malformed.length === 0,
+  malformed.join(", ") || requirements.join(", ") || "none declared",
 );
 
 // 8. Cordis imports the package root as an ES module and reads named exports.

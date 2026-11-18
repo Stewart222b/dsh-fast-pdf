@@ -1,0 +1,15 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- A stack of pages: the reader scrolls one sheet after another. -->
+  <rect x="13.5" y="6.5" width="15" height="21" rx="2.2" fill="#BBD4F7" />
+  <rect x="9" y="9.5" width="15" height="21" rx="2.2" fill="url(#fp-page)" />
+  <rect x="12" y="14" width="9" height="1.4" rx="0.7" fill="#FFFFFF" />
+  <rect x="12" y="17.5" width="7.5" height="1.4" rx="0.7" fill="#FFFFFF" fill-opacity="0.85" />
+  <rect x="12" y="21" width="8.5" height="1.4" rx="0.7" fill="#FFFFFF" fill-opacity="0.85" />
+  <rect x="12" y="24.5" width="5" height="1.4" rx="0.7" fill="#FFFFFF" fill-opacity="0.7" />
+  <defs>
+    <linearGradient id="fp-page" x1="9" y1="9.5" x2="24" y2="30.5" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6FB6FF" />
+      <stop offset="1" stop-color="#2F55D8" />
+    </linearGradient>
+  </defs>
+</svg>

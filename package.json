@@ -1,26 +1,46 @@
 {
   "name": "dsh-fast-pdf",
-  "version": "0.2.0",
-  "private": true,
+  "version": "0.3.0",
   "type": "module",
   "description": "Default PDF renderer for the DSH sidebar: continuous scroll, crisp zoom, native text selection.",
   "keywords": [
     "dsh",
     "dsh-plugin",
-    "pdf"
+    "deepseek-harness",
+    "pdf",
+    "pdf-viewer",
+    "translate"
   ],
   "license": "MIT",
+  "author": "Stewart222b",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Stewart222b/dsh-fast-pdf.git"
+  },
+  "homepage": "https://github.com/Stewart222b/dsh-fast-pdf#readme",
+  "bugs": {
+    "url": "https://github.com/Stewart222b/dsh-fast-pdf/issues"
+  },
+  "icon": "./icon.svg",
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0-0 <0.3.0-0"
+  },
   "scripts": {
-    "test": "node tests/body-reads-without-handle.mjs && node tests/center-zoom.mjs && node tests/client-smoke.mjs && node tests/document-tools.mjs && node tests/host-route-live.mjs && node tests/install-check.mjs && node tests/pinch-spacing.mjs && node tests/preferences.mjs && node tests/reattach-paint.mjs && node tests/render-queue.mjs && node tests/scroll-diagnostics.mjs && node tests/scroll-lookup.mjs && node tests/search-navigation.mjs && node tests/translation-options.mjs && node tests/viewer-reattach.mjs && node tests/visual-diff-test.mjs && node tests/wheel-pinch.mjs",
+    "test": "node tests/pack-manifest.mjs && node tests/body-reads-without-handle.mjs && node tests/center-zoom.mjs && node tests/client-smoke.mjs && node tests/document-tools.mjs && node tests/host-route-live.mjs && node tests/pinch-spacing.mjs && node tests/preferences.mjs && node tests/reattach-paint.mjs && node tests/render-queue.mjs && node tests/scroll-diagnostics.mjs && node tests/scroll-lookup.mjs && node tests/search-navigation.mjs && node tests/translation-options.mjs && node tests/viewer-reattach.mjs && node tests/visual-diff-test.mjs && node tests/wheel-pinch.mjs",
+    "check:pack": "node tests/pack-manifest.mjs",
     "check:install": "node tests/install-check.mjs",
     "check:documents": "node tests/document-tools.mjs",
     "check:host": "node tests/host-live.mjs",
-    "check:route": "node tests/host-route-live.mjs"
+    "check:route": "node tests/host-route-live.mjs",
+    "prepack": "node tests/pack-manifest.mjs"
   },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
-    "./package.json": "./package.json"
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "index.js",
@@ -30,10 +50,16 @@
     "documents.js",
     "bridge.js",
     "http-body.js",
+    "extract.js",
+    "paths.js",
     "cordis.patch.yml",
     "public",
     "tests",
-    "README.md"
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {

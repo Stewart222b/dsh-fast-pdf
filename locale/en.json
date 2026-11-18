@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Fast PDF",
+    "description": "Reads PDFs in the right sidebar beside the conversation and takes over the preview a .pdf opens in by default. Pages scroll as one continuous column with zoom (Ctrl+wheel included), fit-to-width, an outline that floats over the page, search, page-number jump, document properties and back/forward reading history; each tab remembers where you were. Select text and a Translate button appears beside it, answering in a bubble using the session's own model — no API key. The conversation can read the same file through the tools pdf_open, pdf_search, pdf_read_pages, pdf_outline, pdf_page_image and pdf_list, so a question about a page needs no copy-paste. Password-protected PDFs ask for the password in a card. Translation language, default zoom and page spacing live under the reader's own More → Settings. Files are read on this machine and never uploaded; with the bundle off, the built-in previewer returns and the pdf_* tools disappear.",
+    "detail": "docs/DETAIL.md"
+  }
+}

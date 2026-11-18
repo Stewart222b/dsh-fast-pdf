@@ -34,7 +34,7 @@ DSH 侧的 PDF 阅读器：默认接管右侧预览里的 `.pdf`，内置 PDF �
 | `index.js` | 宿主半边：`/fast-pdf` 静态路由（ETag、HEAD、405、路径越界拒绝）+ `POST /fast-pdf/translate` + `POST /fast-pdf/sync`（页面文本上行）+ `POST /fast-pdf/work`（给浏览器派渲图任务）|
 | `translate.js` | 划词翻译：按会话正在用的 provider/model 调 `ctx.llm.stream` |
 | `documents.js` | 宿主侧的页面文本存储：按 `docId` 缓存、按会话排队、检索与目录过滤。**不 import `public/search.mjs`** —— 那份带高亮所需的字符映射，宿主只需要「在第几页」|
-| `tools.js` | 五个工具的纯定义对象（`pdf_search` / `pdf_read_pages` / `pdf_outline` / `pdf_page_image` / `pdf_list`），手写 `ToolDefinition` 而不是 `import { defineTool }` |
+| `tools.js` | 六个工具的纯定义对象（`pdf_open` / `pdf_search` / `pdf_read_pages` / `pdf_outline` / `pdf_page_image` / `pdf_list`），手写 `ToolDefinition` 而不是 `import { defineTool }` |
 | `bridge.js` | 宿主 → 浏览器的图像通道，方向反过来的请求/响应：pane 挂一个长请求等活儿，宿主有渲图需求时作答 |
 | `http-body.js` | 带上限的请求体读取（翻译 96 KB、页面文本 8 MB，两个上限各有理由）|
 | `client.js` | 注册 `.pdf` 预览 + 文档体；工具栏、目录、查找、划词气泡；按需加载渲染器 |
@@ -47,7 +47,7 @@ DSH 侧的 PDF 阅读器：默认接管右侧预览里的 `.pdf`，内置 PDF �
 | `tests/client-smoke.mjs` | 无头自检（路由、模块图、注册、主题令牌） |
 | `tests/host-route-live.mjs` | 把宿主半边架在真 socket 上：路由匹配、媒体类型、304、越界、翻译往返；`--serve` 模式还能给浏览器当静态服务器 |
 | `tests/install-check.mjs` | 不开 GUI 也能答的一个问题：profile 那侧是不是真的接上了这个包 |
-| `tests/document-tools.mjs` | 文档那一半的无头自检：文本存储、检索、五个工具、渲图通道、sync 路由 |
+| `tests/document-tools.mjs` | 文档那一半的无头自检：文本存储、检索、六个工具、渲图通道、sync 路由 |
 | `tests/host-live.mjs` | 对着跑着的 GUI 验宿主半边是否真的加载了（`--page` 读页面自报的接管顺序） |
 | `tests/browser/` | 面板自检场：`index.html` 二十个场景 + `drive.mjs`（无头 Edge 的 CDP 驱动）+ `run-scenario.ps1`（一条命令跑一个场景）+ `make-samples.mjs`（生成样本 PDF） |
 | `cordis.patch.yml` | 插件挂载点 |
@@ -304,16 +304,17 @@ node tests\host-route-live.mjs --serve 8899 tests\browser
 
 ```powershell
 node tests\client-smoke.mjs        # 直接调 handler，假 req/res
-node tests\document-tools.mjs      # 文本存储、检索、五个工具、渲图通道
+node tests\document-tools.mjs      # 文本存储、检索、六个工具、渲图通道
 node tests\reattach-paint.mjs      # 切回时那一帧：该省的排版权一次都不能多
 node tests\install-check.mjs       # 从 profile 出发，照加载器的方式把包解析一遍
 node tests\host-route-live.mjs     # 真的 http 服务 + 真 socket
 node tests\visual-diff.mjs a.png b.png    # 两张同尺寸截图，只回答「变了多少」
 ```
 
-`npm test` 跑十六个：上面五个（`visual-diff.mjs` 除外，它是给人用的比较器，自己那十一条断言在 `visual-diff-test.mjs`）加下面十一个。剩下的两个不在里面——`host-live.mjs` 要一个活着的宿主，`visual-diff.mjs`、`browser/` 那一套要浏览器和截图，都不该拖住一条 `npm test`。
+`npm test` 跑十七个：上面五个（`visual-diff.mjs` 除外，它是给人用的比较器，自己那十一条断言在 `visual-diff-test.mjs`）加下面十二个。剩下的三个不在里面——`host-live.mjs` 要一个活着的宿主，`visual-diff.mjs`、`browser/` 那一套要浏览器和截图，都不该拖住一条 `npm test`。第一份是 `pack-manifest.mjs`：它按 npm 的方式读 `files`，再从两个入口走一遍 import 图，问「打包出去的东西到底能不能加载」，见下面「发布」。
 
 ```powershell
+node tests\pack-manifest.mjs       # 发布清单：files 覆盖、locale、图标、详情页、import 图
 node tests\center-zoom.mjs         # 缩放锚点：放大缩小时光标下的那一行不动
 node tests\pinch-spacing.mjs       # 捏合预览期间的页间距
 node tests\preferences.mjs         # 偏好文件的读写与旧值迁移（`page-fit` → `page-width`）
@@ -887,6 +888,28 @@ ok  the running page applied this build of the bundle — applied 1s after the l
 ### 34 MB 的那一份，翻页和查找也走通了
 
 `make-samples.mjs` 里那份 `huge.pdf`（35,666,428 B，正好越过 32 MiB 的墙）在自检场里当普通样本用：`mount` 场景 40 张画布全出来、`reader=plugin-route`（字节走的是 `/fast-pdf/file`，不是宿主内存里的 `content`）；`find` 场景搜 `Page` 得 `1 / 40`，3 处高亮落在 3 页上，`next` 跳到 2/40，`Escape` 清干净。也就是说"大文件"这条路上没有另外一套代码——它和解压后的小文件走同一条。
+
+## 发布
+
+发到 npm 之前，`package.json` 的 `files` 是唯一决定「装上去有没有东西」的地方：本地直接 link 会绕过它，所以漏文件在开发机上永远看不出来。`tests/pack-manifest.mjs` 就是为这件事写的——它按 npm 的规则读 `files`，从 `index.js` 和 `client.js` 两个入口走一遍 import 图，再检查 locale、图标、详情页；`npm pack` 的 `prepack` 也挂在它上面，清单漏文件时打包直接失败。
+
+一次发版：
+
+```powershell
+npm test                       # 十七份，其中第一份就是发布清单
+npm pack --dry-run             # 看真实文件列表与体积（当前 281 个文件 / 3.2 MB）
+npm version patch|minor        # 打 tag
+git push --follow-tags
+npm publish --access public    # 需要先 npm login
+```
+
+装的人那边：
+
+```powershell
+dsh plugin --profile desktop add dsh-fast-pdf
+```
+
+或者在插件管理器的「安装」里填 `dsh-fast-pdf`。发布后如果想进社区目录，条目在 [`awesome-dsh-plugin`](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)——那份目录是 dshmarket 的 Discover 读的源，跟这个仓库分开发。
 
 ## 许可与第三方
 
