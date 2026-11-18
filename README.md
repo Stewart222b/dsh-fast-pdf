@@ -8,7 +8,7 @@ DSH 侧的 PDF 阅读器：默认接管右侧预览里的 `.pdf`，内置 PDF �
 
 | 想知道 | 回答 |
 |---|---|
-| 装在哪 | 桌面版 profile 里已经装好（`~/.dsh/profiles/desktop/package.json` 的 `bundles` 有 `dsh-fast-pdf`，包目录是指向本仓库的 junction） |
+| 怎么装 | `dsh plugin --profile desktop add dsh-fast-pdf`（已发布到 npm，当前 `0.3.0`）；从仓库开发则 `add <本仓库路径>` |
 | 怎么确认生效 | 打开一个 `.pdf`，预览器标题写着「快速 PDF」，右上角多出「打开方式」下拉（内置预览器平时只有一个候选，所以那个按钮本来不出现） |
 | 想用回内置 | 那个下拉里点内置那个，随时切回；选择记在 tab 上 |
 | 怎么改完生效 | `public/*`：刷新页面；`client.js`：刷新页面；`index.js`：按一下 unlag 的刷新按钮（不用重启宿主） |
