@@ -38,8 +38,11 @@ import { isAbsoluteWorkspacePath, parseFileAddress, workspaceRootFor } from "./p
 
 export const name = "fast-pdf";
 
-/** Service dependency: the named HTTP route table. */
-export const inject = ["webServer"];
+/**
+ * Service dependencies: the named HTTP route table, and the connection fence
+ * that decides whether a request may touch it at all.
+ */
+export const inject = ["webServer", "connection"];
 
 /** Route prefix the client half resolves against `document.baseURI`. */
 const ROUTE_PREFIX = "/fast-pdf";
@@ -770,12 +773,44 @@ async function workHandler(req, res) {
 }
 
 /**
+ * Wrap a route handler in Connection's Host/Origin and browser-authentication
+ * fence.
+ *
+ * The fence is the only thing standing between these routes and any page the
+ * user has open: without it a cross-site form post or a DNS-rebinding host can
+ * reach the translation route, the file route, or the work queue, because the
+ * Host's loopback listener trusts whatever reaches it. `requestRejection`
+ * returns 403 for an untrusted Host/Origin and 401 for a caller with no live
+ * authenticated Peer, and `undefined` only when the request may proceed — the
+ * same test the installed `open-in-app` and inspector hosts apply.
+ *
+ * Every route registers through this wrapper rather than calling it inside each
+ * handler, so a route added later is fenced by construction instead of by
+ * remembering to add two lines.
+ *
+ * @param ctx - plugin context carrying the connection service.
+ * @param handler - the route's own handler.
+ * @returns a handler that answers a rejection before delegating.
+ */
+function fenced(ctx, handler) {
+  return (req, res) => {
+    const rejection = ctx.connection.requestRejection(req);
+    if (rejection !== undefined) {
+      res.statusCode = rejection;
+      res.end();
+      return undefined;
+    }
+    return handler(req, res);
+  };
+}
+
+/**
  * Register the asset and translation routes for the lifetime of this plugin.
  * @param ctx - plugin context carrying the web server service.
  */
 export function apply(ctx) {
   ctx.effect(
-    () => ctx.webServer.register({ kind: "prefix", path: ROUTE_PREFIX, handler }),
+    () => ctx.webServer.register({ kind: "prefix", path: ROUTE_PREFIX, handler: fenced(ctx, handler) }),
     "fast-pdf: assets",
   );
   ctx.effect(
@@ -783,24 +818,29 @@ export function apply(ctx) {
       ctx.webServer.register({
         kind: "exact",
         path: TRANSLATE_PATH,
-        handler: (req, res) => translateHandler(ctx, req, res),
+        handler: fenced(ctx, (req, res) => translateHandler(ctx, req, res)),
       }),
     "fast-pdf: translate",
   );
   ctx.effect(
-    () => ctx.webServer.register({ kind: "exact", path: HELLO_PATH, handler: helloHandler }),
+    () => ctx.webServer.register({ kind: "exact", path: HELLO_PATH, handler: fenced(ctx, helloHandler) }),
     "fast-pdf: hello",
   );
   ctx.effect(
-    () => ctx.webServer.register({ kind: "exact", path: FILE_PATH, handler: (req, res) => fileHandler(ctx, req, res) }),
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: FILE_PATH,
+        handler: fenced(ctx, (req, res) => fileHandler(ctx, req, res)),
+      }),
     "fast-pdf: file",
   );
   ctx.effect(
-    () => ctx.webServer.register({ kind: "exact", path: SYNC_PATH, handler: syncHandler }),
+    () => ctx.webServer.register({ kind: "exact", path: SYNC_PATH, handler: fenced(ctx, syncHandler) }),
     "fast-pdf: sync",
   );
   ctx.effect(
-    () => ctx.webServer.register({ kind: "exact", path: WORK_PATH, handler: workHandler }),
+    () => ctx.webServer.register({ kind: "exact", path: WORK_PATH, handler: fenced(ctx, workHandler) }),
     "fast-pdf: work",
   );
   // The tools are optional: a Host without the tool service (or a profile where

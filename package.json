@@ -1,6 +1,6 @@
 {
   "name": "dsh-fast-pdf",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Default PDF renderer for the DSH sidebar: continuous scroll, crisp zoom, native text selection.",
   "keywords": [

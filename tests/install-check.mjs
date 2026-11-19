@@ -194,8 +194,10 @@ check(
   `inject: ${JSON.stringify(host.inject)}`,
 );
 check(
-  "the host half asks for the web server only",
-  Array.isArray(host.inject) && host.inject.length === 1 && host.inject[0] === "webServer",
+  "the host half asks for the web server and the connection fence",
+  Array.isArray(host.inject)
+    && host.inject.includes("webServer")
+    && host.inject.includes("connection"),
   JSON.stringify(host.inject),
 );
 
@@ -218,6 +220,14 @@ host.apply({
       return () => {};
     },
   },
+  connection: {
+    // Pretend every request is trusted; the guard test below uses a fence that
+    // rejects, so the two together prove the routes are fenced rather than
+    // accidentally unreachable.
+    requestRejection() {
+      return undefined;
+    },
+  },
 });
 check(
   "applying the host half registers the six routes",
@@ -228,6 +238,89 @@ check(
   "every effect carries a label",
   effects.every((label) => label !== "(unlabelled)"),
   effects.join(" | "),
+);
+
+// 9b. Every registered route must consult the connection fence before it does
+//     anything. Without this a page the user happens to have open reaches the
+//     translation and file routes: the loopback listener trusts any Host/Origin
+//     that arrives. So the whole host is applied a second time against a fence
+//     that rejects, and each route is driven once: the route must answer with
+//     the fence's status and its own work must not run.
+const fencedRoutes = new Map();
+// `get`/`set` are consulted while the plugin registers its tools, which is not
+// route work; only a lookup that happens after a request arrives counts, so the
+// flag is cleared once registration has finished.
+let routeWorkRan = null;
+const fencedCtx = {
+  effect(fn) {
+    fn();
+    return () => {};
+  },
+  webServer: {
+    register(route) {
+      fencedRoutes.set(route.path, route.handler);
+      return () => {};
+    },
+  },
+  connection: {
+    requestRejection() {
+      return 403;
+    },
+  },
+  // Any of these being reached during a request means the fence did not
+  // short-circuit.
+  get(sub) {
+    routeWorkRan = sub;
+    return undefined;
+  },
+  set(sub) {
+    routeWorkRan = sub;
+    return undefined;
+  },
+  logger: {
+    warn() {},
+    info() {},
+    error() {},
+  },
+};
+host.apply(fencedCtx);
+routeWorkRan = null;
+
+const fenceRefusals = [];
+for (const [routePath, routeHandler] of fencedRoutes) {
+  let status = null;
+  let ended = false;
+  try {
+    await routeHandler(
+      { method: "GET", url: routePath, headers: {}, on() {}, removeListener() {} },
+      {
+        set statusCode(value) {
+          status = value;
+        },
+        get statusCode() {
+          return status;
+        },
+        end() {
+          ended = true;
+        },
+        writeHead() {},
+        write() {},
+        on() {},
+        removeListener() {},
+      },
+    );
+  } catch (error) {
+    fenceRefusals.push(`${routePath} threw ${error.message}`);
+    continue;
+  }
+  if (status !== 403 || !ended) fenceRefusals.push(`${routePath} answered ${String(status)} ended=${ended}`);
+}
+check(
+  "every route refuses an untrusted request before doing its own work",
+  fenceRefusals.length === 0 && fencedRoutes.size === 6 && routeWorkRan === null,
+  fenceRefusals.join(", ")
+    || `${fencedRoutes.size} routes answered 403`
+    + (routeWorkRan === null ? ", no route work ran" : `, but ${routeWorkRan} was reached`),
 );
 
 // 10. The client bundle keeps to the shell's seed table — the same rule the smoke

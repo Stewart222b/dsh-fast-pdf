@@ -27,11 +27,14 @@
 
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
+import { connect } from "node:net";
 import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
 const WANT_TRANSLATE = args.includes("--translate");
 const WANT_PAGE = args.includes("--page");
+const TOKEN_INDEX = args.indexOf("--token");
+const LOGIN_TOKEN = TOKEN_INDEX === -1 ? "" : (args[TOKEN_INDEX + 1] ?? "");
 const BASE = (args.find((argument) => argument.startsWith("http")) ?? "http://127.0.0.1:56825").replace(/\/+$/u, "");
 const VIEWER = `${BASE}/fast-pdf/viewer.mjs`;
 const STYLE = `${BASE}/fast-pdf/viewer.css`;
@@ -52,10 +55,33 @@ function check(label, ok, detail) {
   console.log(`${ok ? "ok  " : "FAIL"}  ${label}${detail === "" ? "" : ` — ${detail}`}`);
 }
 
+/**
+ * Cookie header the fence accepts, when the caller supplied a session.
+ *
+ * The host half fences every route behind `ctx.connection.requestRejection`, so
+ * a probe without a session is answered 401 and tests nothing about the route
+ * itself. Pass `--token <login-token>` (the value the Host prints as
+ * `?token=…` on boot) and this file mints that cookie once, then sends it.
+ */
+let SESSION_COOKIE = "";
+/**
+ * Exchange the login token for the Host's session cookie.
+ * @param base - the Host origin.
+ * @param token - the `?token=` value printed at boot.
+ * @returns the cookie pair, or "" when the Host refuses the token.
+ */
+async function mintSession(base, token) {
+  const response = await fetch(`${base}/?token=${encodeURIComponent(token)}`, { redirect: "manual" });
+  const raw = response.headers.getSetCookie?.() ?? [];
+  if (raw.length === 0) return "";
+  return raw.map((entry) => entry.split(";")[0]).join("; ");
+}
+
 /** One request that never throws; a transport error becomes a status of 0. */
 async function probe(method, url, headers = {}) {
   try {
-    const response = await fetch(url, { method, headers, redirect: "manual" });
+    const merged = SESSION_COOKIE === "" ? headers : { ...headers, cookie: SESSION_COOKIE };
+    const response = await fetch(url, { method, headers: merged, redirect: "manual" });
     const type = response.headers.get("content-type") ?? "";
     const length = response.headers.get("content-length") ?? "";
     let text = "";
@@ -65,6 +91,48 @@ async function probe(method, url, headers = {}) {
   } catch (error) {
     return { status: 0, type: "", text: "", error: String(error?.message ?? error) };
   }
+}
+
+/**
+ * Send one raw request line on a socket, so the path reaches the Host exactly as
+ * written instead of being folded by a URL parser first.
+ * @param base - the Host origin.
+ * @param requestLine - the request line, e.g. `GET /fast-pdf/../x HTTP/1.1`.
+ * @returns the status code the Host answered, or 0 with `error` set.
+ */
+async function probeRaw(base, requestLine) {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve) => {
+    const socket = connect({ host: hostname, port: Number(port || 80) });
+    let buffer = "";
+    const done = (result) => {
+      socket.destroy();
+      resolve(result);
+    };
+    socket.setTimeout(10_000, () => done({ status: 0, error: "timeout" }));
+    socket.on("connect", () => {
+      const cookie = SESSION_COOKIE === "" ? "" : `cookie: ${SESSION_COOKIE}\r\n`;
+      socket.write(`${requestLine}\r\nhost: ${hostname}:${port}\r\n${cookie}connection: close\r\n\r\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("latin1");
+      const match = /^HTTP\/1\.[01] (\d{3})/u.exec(buffer);
+      if (match !== null) done({ status: Number(match[1]), error: "" });
+    });
+    socket.on("error", (error) => done({ status: 0, error: String(error?.message ?? error) }));
+    socket.on("close", () => {
+      if (buffer === "") done({ status: 0, error: "closed with no response" });
+    });
+  });
+}
+
+if (LOGIN_TOKEN !== "") {
+  SESSION_COOKIE = await mintSession(BASE, LOGIN_TOKEN);
+  check(
+    "a login token buys a session cookie",
+    SESSION_COOKIE !== "",
+    SESSION_COOKIE === "" ? "the Host refused the token" : "cookie minted, the fence should now admit",
+  );
 }
 
 const viewer = await probe("GET", VIEWER);
@@ -108,12 +176,25 @@ const wasm = await probe("HEAD", `${BASE}/fast-pdf/wasm/openjpeg.wasm`);
 check("the host reaches a nested wasm module", wasm.status === 200, `${wasm.status} ${wasm.type}`);
 
 // A link-less <a> is not opened; pdf.js asks for these through fetch, so an
-// escaping path has to be refused rather than resolved.
-const escape = await probe("HEAD", `${BASE}/fast-pdf/../index.html`);
+// escaping path must not reach a file outside `public/`.
+//
+// `/fast-pdf/../x` cannot test that here: Node's HTTP server normalises the
+// target to `/x` before any route is matched, so the plugin's asset route never
+// sees the request and the 200 belongs to the Host's own index route. What the
+// asset route can actually be handed is a traversal *inside* the prefix, which
+// is what a URL parser leaves alone, so that is the form tested — on a raw
+// socket, because `fetch` would fold it too.
+const escape = await probeRaw(BASE, "GET /fast-pdf/..%2f..%2fpackage.json HTTP/1.1");
+const escapeEncoded = await probeRaw(BASE, "GET /fast-pdf/%2e%2e/%2e%2e/package.json HTTP/1.1");
 check(
-  "a path escape never resolves",
-  escape.status !== 200,
-  `${escape.status}${escape.status === 401 ? " (the Host normalised it away and asked for a session)" : ""}`,
+  "a path escape inside the prefix never resolves to a file outside public/",
+  escape.status !== 200 && escapeEncoded.status !== 200,
+  `${escape.status || escape.error} / ${escapeEncoded.status || escapeEncoded.error}`,
+);
+check(
+  "the plugin's own package manifest is not served as an asset",
+  (await probeRaw(BASE, "GET /fast-pdf/package.json HTTP/1.1")).status !== 200,
+  "GET /fast-pdf/package.json refused",
 );
 
 // The browser half is handed to the page by the *client-module graph*, not by

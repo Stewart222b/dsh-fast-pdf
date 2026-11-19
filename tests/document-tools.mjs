@@ -18,6 +18,16 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const failures = [];
 
 /**
+ * A stand-in `connection` service that admits every request.
+ *
+ * The host half fences each route behind `ctx.connection.requestRejection`, so
+ * a fake context without this member throws on the first request. These tests
+ * drive route handlers directly to test the routes' own logic; the fence itself
+ * has its own test in `install-check.mjs`.
+ */
+const admittingConnection = { requestRejection: () => undefined };
+
+/**
  * Run one named check, recording a failure instead of aborting the suite.
  * @param name - check label.
  * @param fn - async body.
@@ -734,6 +744,7 @@ await check("the sync route stores what the pane uploads", async () => {
     effect: (fn) => { fn(); return () => {}; },
     get: () => undefined,
     webServer: { register: (route) => { routes.push(route); return () => {}; } },
+    connection: admittingConnection,
   });
   const sync = routes.find((route) => route.path === "/fast-pdf/sync");
   assert.ok(sync, "the sync route must exist");
@@ -810,6 +821,7 @@ await check("the sync route answers GET with the method it allows", async () => 
     effect: (fn) => { fn(); return () => {}; },
     get: () => undefined,
     webServer: { register: (route) => { routes.push(route); return () => {}; } },
+    connection: admittingConnection,
   });
   const sync = routes.find((route) => route.path === "/fast-pdf/sync");
   const out = { status: 0, headers: {} };
@@ -840,6 +852,7 @@ await check("the poll tells a pane its document is gone, so it can send the page
     effect: (fn) => { fn(); return () => {}; },
     get: () => undefined,
     webServer: { register: (route) => { routes.push(route); return () => {}; } },
+    connection: admittingConnection,
   });
   const work = routes.find((route) => route.path === "/fast-pdf/work");
   assert.ok(work, "the work route must exist");
@@ -901,6 +914,7 @@ await check("the tools reach the Host through apply", async () => {
         ? { register: (definition) => { registered.push(definition.name); return () => {}; } }
         : undefined,
     webServer: { register: (route) => { routes.push(route); return () => {}; } },
+    connection: admittingConnection,
     log: () => {},
   });
   assert.deepEqual(registered, ["pdf_open", "pdf_search", "pdf_read_pages", "pdf_outline", "pdf_page_image", "pdf_list"]);
@@ -914,6 +928,7 @@ await check("a Host without a tool service still gets its routes", async () => {
       effect: (fn) => { fn(); return () => {}; },
       get: () => { throw new Error("no such service"); },
       webServer: { register: (route) => { routes.push(route); return () => {}; } },
+      connection: admittingConnection,
     }),
   );
   assert.equal(routes.length, 6, "a throwing service lookup must not cost the viewer its routes");

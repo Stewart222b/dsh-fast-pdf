@@ -17,6 +17,22 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PUBLIC = join(ROOT, "public");
+
+/**
+ * A stand-in `connection` service that admits every request.
+ *
+ * The host half fences each route behind `ctx.connection.requestRejection`, so
+ * a fake context without this member throws on the first request instead of
+ * exercising the route. These tests drive route handlers directly to test the
+ * routes' own logic; the fence has its own test in `install-check.mjs`.
+ */
+const admittingConnection = { requestRejection: () => undefined };
+
+/**
+ * A stand-in `connection` service that refuses every request.
+ * @returns an object shaped like the real service's fence.
+ */
+const refusingConnection = { requestRejection: () => 403 };
 const failures = [];
 
 /**
@@ -39,9 +55,21 @@ console.log("host half");
 await check("route answers the renderer and refuses escapes", async () => {
   const mod = await import(pathToFileURL(join(ROOT, "index.js")).href);
   assert.equal(mod.name, "fast-pdf");
-  assert.deepEqual(mod.inject, ["webServer"]);
+  assert.deepEqual(mod.inject, ["webServer", "connection"]);
   const routes = [];
-  const ctx = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (r) => { routes.push(r); return () => {}; } } };
+  const ctx = {
+    effect: (fn) => {
+      fn();
+      return () => {};
+    },
+    webServer: {
+      register: (r) => {
+        routes.push(r);
+        return () => {};
+      },
+    },
+    connection: admittingConnection,
+  };
   mod.apply(ctx);
   const route = routes.find((r) => r.kind === "prefix");
   assert.ok(route, "the asset route must be registered as a prefix route");
@@ -106,6 +134,7 @@ await check("translation route answers with the session's model", async () => {
     effect: (fn) => { fn(); return () => {}; },
     get: (name) => (name === "llm" ? llm : name === "agents" ? agents : undefined),
     webServer: { register: (r) => { routes.push(r); return () => {}; } },
+    connection: admittingConnection,
   };
   mod.apply(ctx);
   const translate = routes.find((r) => r.path === "/fast-pdf/translate");
@@ -163,6 +192,7 @@ await check("translation route answers with the session's model", async () => {
     effect: (fn) => { fn(); return () => {}; },
     get: (name) => (name === "agents" ? agents : undefined),
     webServer: { register: (r) => { bare.push(r); return () => {}; } },
+    connection: admittingConnection,
   });
   const bareRoute = bare.find((r) => r.path === "/fast-pdf/translate");
   const out = { status: 0, body: undefined };

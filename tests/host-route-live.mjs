@@ -142,6 +142,7 @@ async function mount(fallback) {
     },
     get: services.get,
     webServer: { register: (route) => routes.register(route) },
+    connection: { requestRejection: () => undefined },
   });
   const server = createServer((req, res) => {
     const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
@@ -206,6 +207,7 @@ if (plan !== -1) {
     },
     get: services.get,
     webServer: { register: (route) => routes.register(route) },
+    connection: { requestRejection: () => undefined },
   });
   const serve = staticFallback(dir);
   const clientHalf = join(ROOT, "client.js");
@@ -552,6 +554,7 @@ if (plan !== -1) {
         },
         get: services.get,
         webServer: { register: (route) => routes.register(route) },
+        connection: { requestRejection: () => undefined },
       });
       const server = createServer((req, res) => {
         const route = routes.match(new URL(req.url ?? "/", "http://localhost").pathname);
